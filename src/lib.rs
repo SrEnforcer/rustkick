@@ -9,7 +9,7 @@ mod dsp;
 mod editor;
 mod params;
 
-use dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Noise, SineOsc};
+use dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, SineOsc};
 use params::HardKickParams;
 
 // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
@@ -37,13 +37,14 @@ pub struct HardKick {
     click_env: Envelope,
     click_hp: BiquadFilter,
     crossover: LRCrossover,
+    limiter: Limiter,
 }
 
 impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(340, 830),
+            editor_state: EguiState::from_size(340, 920),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
@@ -63,6 +64,7 @@ impl Default for HardKick {
             click_env: Envelope::default(),
             click_hp: BiquadFilter::default(),
             crossover: LRCrossover::default(),
+            limiter: Limiter::default(),
         }
     }
 }
@@ -151,6 +153,7 @@ impl Plugin for HardKick {
         self.click_env = Envelope::default();
         self.click_hp.reset();
         self.crossover.reset();
+        self.limiter.reset();
     }
 
     fn process(
@@ -178,6 +181,11 @@ impl Plugin for HardKick {
             .set_highpass(self.params.click_tone.value(), 0.707, self.sample_rate);
         self.crossover
             .set_freq(self.params.crossover_freq.value(), self.sample_rate);
+        self.limiter.set_params(
+            self.params.limiter_threshold.value(),
+            self.params.limiter_release.value(),
+            self.sample_rate,
+        );
 
         if !playing {
             self.beat_phase = 0.0;
@@ -276,9 +284,9 @@ impl Plugin for HardKick {
                 0.0
             };
 
-            // Final safety clip; the shapers are already bounded, so this only
-            // catches extreme parameter combinations. A proper limiter comes later.
-            let raw = (tonal + click).clamp(-1.0, 1.0);
+            // Brickwall limiter — lookahead peak detection, instant attack,
+            // configurable release. Replaces the crude hard clip from earlier milestones.
+            let raw = self.limiter.process(tonal + click);
 
             // Declick: linearly fade to zero before firing a pending retrigger.
             let value = if self.declick_counter > 0 {

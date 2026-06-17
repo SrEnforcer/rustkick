@@ -344,6 +344,30 @@ pub fn create(
 
                 ui.add_space(6.0);
 
+                // ── OUTPUT / LIMITER ─────────────────────────────────────────
+                section_header(ui, "OUTPUT");
+                ui.add_space(4.0);
+                egui::Grid::new("output_params")
+                    .num_columns(2)
+                    .min_col_width(90.0)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label("Ceiling");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.limiter_threshold,
+                            setter,
+                        ));
+                        ui.end_row();
+                        ui.label("Release");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.limiter_release,
+                            setter,
+                        ));
+                        ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+
                 // ── SEQUENCER ────────────────────────────────────────────────
                 section_header(ui, "SEQUENCER");
                 ui.add_space(4.0);

@@ -89,6 +89,16 @@ pub struct HardKickParams {
     #[id = "crossover_freq"]
     pub crossover_freq: FloatParam,
 
+    /// Output limiter ceiling in dBFS. The limiter prevents the output from
+    /// exceeding this level regardless of drive or level settings.
+    #[id = "limiter_threshold"]
+    pub limiter_threshold: FloatParam,
+
+    /// Output limiter release time in milliseconds — how quickly gain recovers
+    /// after a peak has passed.
+    #[id = "limiter_release"]
+    pub limiter_release: FloatParam,
+
     /// Internal sequencer tempo in BPM.
     #[id = "bpm"]
     pub bpm: FloatParam,
@@ -245,6 +255,29 @@ impl Default for HardKickParams {
             )
             .with_unit(" Hz")
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+
+            limiter_threshold: FloatParam::new(
+                "Limiter ceiling",
+                -0.3,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 0.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            limiter_release: FloatParam::new(
+                "Limiter release",
+                100.0,
+                FloatRange::Skewed {
+                    min: 10.0,
+                    max: 500.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
 
             crossover_freq: FloatParam::new(
                 "Crossover",
