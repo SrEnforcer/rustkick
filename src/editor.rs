@@ -1,3 +1,4 @@
+use crate::dsp::shape;
 use crate::params::HardKickParams;
 use nih_plug::prelude::Editor;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
@@ -46,14 +47,23 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
             + (params.pitch_end.value() - params.pitch_start.value())
                 * t_pitch.powf(params.curve.value());
         let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value();
-        wave.push((phase * TAU).sin() * amp);
+
+        // Mirror the audio path so the preview reflects the distortion settings.
+        let osc = (phase * TAU).sin();
+        let shaped = shape(
+            osc,
+            params.shaper.value(),
+            params.drive.value(),
+            params.bias.value(),
+        );
+        let mix = params.dist_mix.value();
+        let body = osc + (shaped - osc) * mix;
+        wave.push((body * amp).clamp(-1.0, 1.0));
         phase = (phase + freq * step / sr).fract();
     }
 
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 80.0),
-        egui::Sense::hover(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
 
     if !ui.is_rect_visible(rect) {
         return;
@@ -157,6 +167,32 @@ pub fn create(
 
                         ui.label("Level");
                         ui.add(widgets::ParamSlider::for_param(&params.level, setter));
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                section_header(ui, "SHAPING");
+                ui.add_space(4.0);
+
+                egui::Grid::new("shaping_params")
+                    .num_columns(2)
+                    .min_col_width(90.0)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Shaper");
+                        ui.add(widgets::ParamSlider::for_param(&params.shaper, setter));
+                        ui.end_row();
+
+                        ui.label("Drive");
+                        ui.add(widgets::ParamSlider::for_param(&params.drive, setter));
+                        ui.end_row();
+
+                        ui.label("Bias");
+                        ui.add(widgets::ParamSlider::for_param(&params.bias, setter));
+                        ui.end_row();
+
+                        ui.label("Mix");
+                        ui.add(widgets::ParamSlider::for_param(&params.dist_mix, setter));
                         ui.end_row();
                     });
 

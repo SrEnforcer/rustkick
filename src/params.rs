@@ -1,3 +1,4 @@
+use crate::dsp::Shaper;
 use nih_plug::prelude::*;
 
 #[derive(Params)]
@@ -29,6 +30,22 @@ pub struct HardKickParams {
     /// Master output level.
     #[id = "level"]
     pub level: FloatParam,
+
+    /// Waveshaping model: sets the character of the distortion.
+    #[id = "shaper"]
+    pub shaper: EnumParam<Shaper>,
+
+    /// Distortion intensity (0.0 = clean, 1.0 = fully driven).
+    #[id = "drive"]
+    pub drive: FloatParam,
+
+    /// Distortion asymmetry — adds even harmonics for a thicker tone.
+    #[id = "bias"]
+    pub bias: FloatParam,
+
+    /// Dry/wet ratio of the distortion (0.0 = unprocessed, 1.0 = fully distorted).
+    #[id = "dist_mix"]
+    pub dist_mix: FloatParam,
 
     /// Internal sequencer tempo in BPM.
     #[id = "bpm"]
@@ -74,15 +91,8 @@ impl Default for HardKickParams {
             .with_unit(" s")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
-            curve: FloatParam::new(
-                "Curve",
-                2.0,
-                FloatRange::Linear {
-                    min: 0.1,
-                    max: 8.0,
-                },
-            )
-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            curve: FloatParam::new("Curve", 2.0, FloatRange::Linear { min: 0.1, max: 8.0 })
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
             amp_decay: FloatParam::new(
                 "Amp decay",
@@ -96,22 +106,24 @@ impl Default for HardKickParams {
             .with_unit(" s")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
-            amp_curve: FloatParam::new(
-                "Amp curve",
-                1.0,
-                FloatRange::Linear {
-                    min: 0.1,
-                    max: 8.0,
-                },
-            )
-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            amp_curve: FloatParam::new("Amp curve", 1.0, FloatRange::Linear { min: 0.1, max: 8.0 })
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
-            level: FloatParam::new(
-                "Level",
-                0.8,
-                FloatRange::Linear { min: 0.0, max: 1.0 },
-            )
-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            level: FloatParam::new("Level", 0.8, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            // Default Soft + drive 0.0 keeps the step-1 tone (clean sine) intact;
+            // the user dials in the hardness deliberately.
+            shaper: EnumParam::new("Shaper", Shaper::Soft),
+
+            drive: FloatParam::new("Drive", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            bias: FloatParam::new("Bias", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            dist_mix: FloatParam::new("Dist mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
             bpm: FloatParam::new(
                 "BPM",

@@ -1,0 +1,501 @@
+From 2ea48c264142cbe7abf4ebe361d6ec9469546eff Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 17 Jun 2026 19:56:07 +0000
+Subject: [PATCH] Add waveshaping distortion stage (milestone 2)
+
+Introduce the first non-linear distortion stage so the synth can actually
+produce a hard kick instead of a pure sine.
+
+- New dsp/distortion module: Soft (tanh), Hard (clip) and Fold (wavefolder)
+  shapers, plus a one-pole DC blocker for the offset asymmetric shaping adds.
+- New params: Shaper, Drive, Bias and Dist mix. Defaults (Soft, drive 0.0)
+  preserve the milestone-1 clean-sine sound.
+- Wire shaping into the process loop before the amplitude envelope, with a
+  final safety clip on the output.
+- Add a SHAPING section to the editor and make the waveform preview reflect
+  the distortion settings.
+- Document the milestone in docs/design/step2.distortion.md.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GwURq9bT1AzMqUHKVyWkmv
+---
+ docs/design/step2.distortion.md |  94 +++++++++++++++++++++++++++++
+ src/dsp/distortion.rs           | 102 ++++++++++++++++++++++++++++++++
+ src/dsp/mod.rs                  |   2 +
+ src/editor.rs                   |  46 ++++++++++++--
+ src/lib.rs                      |  33 +++++++++--
+ src/params.rs                   |  60 +++++++++++--------
+ 6 files changed, 303 insertions(+), 34 deletions(-)
+ create mode 100644 docs/design/step2.distortion.md
+ create mode 100644 src/dsp/distortion.rs
+
+diff --git a/docs/design/step2.distortion.md b/docs/design/step2.distortion.md
+new file mode 100644
+index 0000000..7e7303c
+--- /dev/null
++++ b/docs/design/step2.distortion.md
+@@ -0,0 +1,94 @@
++# hardkick — milestone 2: waveshaping / distortion
++
++Building on milestone 1 (a triggerable, pitched sine sweep), this step adds the
++single most important ingredient for a "hard" kick: **non-linear distortion**.
++
++A pure sine has no harmonics, so no amount of pitch- or amplitude-shaping can
++make it sound hard. Hardness *is* harmonic content, and harmonics come from
++waveshaping. This milestone introduces a small, real-time-safe distortion stage
++plus a DC blocker, and exposes it through the UI and the waveform preview.
++
++No extra layers, no EQ, no oversampling yet — those are later milestones.
++
++---
++
++## Goal
++
++- A selectable waveshaper (`Soft` / `Hard` / `Fold`) applied to the oscillator.
++- `Drive`, `Bias` and `Mix` controls to dial the distortion from clean to extreme.
++- A DC-blocking high-pass to remove the offset that asymmetric shaping creates.
++- The waveform preview reflects the distortion so the shape is visible at a glance.
++- Defaults preserve the milestone-1 sound (clean sine) so nothing changes until
++  the user turns up `Drive`.
++
++---
++
++## DSP design
++
++### Signal order (per sample)
++
++```
++osc → waveshape(drive, bias) → dry/wet mix → DC blocker → × amp envelope → safety clip
++```
++
++The oscillator is shaped at full scale *before* the amplitude envelope is
++applied, so the harmonic content stays consistent across the whole kick instead
++of changing with the decay level.
++
++### Shapers (`src/dsp/distortion.rs`)
++
++- **Soft** — asymmetric `tanh`: `(x·g + b).tanh() − b.tanh()`. Odd harmonics, with
++  even harmonics added as `bias` increases. The subtraction removes the resting
++  DC offset the bias introduces.
++- **Hard** — asymmetric hard clip: `(x·g + b).clamp(−1, 1) − b.clamp(−1, 1)`. Sharp,
++  square character.
++- **Fold** — a wavefolder (`hard_fold`) that mirrors the signal back over a
++  threshold, producing dense, metallic rawstyle overtones.
++
++`drive` (0..1) maps to an input gain of `1 + drive·24`. All three shapers are
++inherently bounded to ≈[−1, 1].
++
++### DC blocker
++
++A first-order high-pass (`y = x − x₁ + R·y₁`, `R = 0.9995`, ≈20 Hz at 44.1 kHz)
++sits right after shaping. Asymmetric distortion produces a DC offset that would
++otherwise eat headroom and cause floating sub frequencies on a PA.
++
++### Output safety
++
++A final `clamp(−1, 1)` guards against extreme parameter combinations. The shapers
++are already bounded, so this is only a safety net — a proper brickwall limiter is
++milestone 4.
++
++---
++
++## Parameters added (`src/params.rs`)
++
++| Param      | Range      | Default | Notes                                  |
++|------------|------------|---------|----------------------------------------|
++| `shaper`   | Soft/Hard/Fold | Soft | Waveshaping model                      |
++| `drive`    | 0.0 – 1.0  | 0.0     | Distortion intensity (0 = clean)       |
++| `bias`     | 0.0 – 1.0  | 0.0     | Asymmetry → even harmonics             |
++| `dist_mix` | 0.0 – 1.0  | 1.0     | Dry/wet of the distorted signal        |
++
++---
++
++## Definition of done
++
++- `cargo build --release` compiles the `cdylib` and standalone without errors.
++- With `Drive = 0` the kick is identical to milestone 1 (clean sine).
++- Raising `Drive` audibly adds harmonics; `Shaper` changes the character and
++  `Bias` thickens the tone.
++- The waveform preview visibly squares off / folds as distortion increases.
++- No heap allocation in the process loop (guarded by `assert_process_alloc`).
++
++---
++
++## Next milestones (not implemented yet)
++
++1. Pre-/post-distortion biquad EQ (the rawstyle "screech" resonance peak).
++2. Click/attack layer (noise burst or separate oscillator) for the "tok".
++3. Linkwitz-Riley crossover to protect the sub from the distortion.
++4. Brickwall limiter on the output.
++5. Oversampling (2×/4×) around the shaper to control aliasing.
++6. Headless offline render to `.wav` for preview generation.
+diff --git a/src/dsp/distortion.rs b/src/dsp/distortion.rs
+new file mode 100644
+index 0000000..fbd9f6d
+--- /dev/null
++++ b/src/dsp/distortion.rs
+@@ -0,0 +1,102 @@
++use nih_plug::prelude::Enum;
++
++/// Waveshaping model that determines which kind of harmonics the distortion generates.
++///
++/// The choice between symmetric and asymmetric shaping is the difference between a
++/// hollow, square hardstyle tone (odd harmonics) and a richer, more aggressive
++/// rawstyle tone (both even and odd harmonics).
++#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Shaper {
++    /// Symmetric soft clip (`tanh`) — odd harmonics, rounded saturation.
++    #[name = "Soft"]
++    Soft,
++    /// Hard clip — sharp, square distortion with strong odd harmonics.
++    #[name = "Hard"]
++    Hard,
++    /// Wavefolder — folds the signal back to carve metallic overtones (rawstyle).
++    #[name = "Fold"]
++    Fold,
++}
++
++/// Folds the signal back over a threshold an arbitrary number of times.
++///
++/// Unlike clipping (which caps the peak), a wavefolder mirrors the amplitude,
++/// producing a very dense harmonic structure. Adapted from the design report
++/// (DSP math of the hardstyle kick).
++fn hard_fold(input: f32, threshold: f32) -> f32 {
++    let sign = input.signum();
++    let x = input.abs();
++
++    if x > threshold {
++        let remainder = x % threshold;
++        let num_folds = (x / threshold).floor() as i32;
++        let y = if num_folds % 2 == 0 {
++            remainder
++        } else {
++            threshold - remainder
++        };
++        y * sign
++    } else {
++        input
++    }
++}
++
++/// Shapes a single sample according to the selected model.
++///
++/// `drive` (0.0..=1.0) controls the intensity and `bias` (0.0..=1.0) introduces
++/// asymmetry. A bias above zero shifts the operating point on the non-linear curve,
++/// generating even harmonics for a thicker, warmer tone. The output is always
++/// bounded to roughly [-1.0, 1.0].
++pub fn shape(x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
++    // Map drive to a usable input gain.
++    let gain = 1.0 + drive * 24.0;
++    let driven = x * gain;
++
++    match mode {
++        // Asymmetric tanh; the subtraction removes the resting DC offset that the
++        // bias introduces (a dedicated DC blocker downstream is still desirable).
++        Shaper::Soft => {
++            let b = bias * 0.9;
++            (driven + b).tanh() - b.tanh()
++        }
++        // Hard clip with asymmetric thresholds: a positive bias makes the bottom
++        // clip sooner than the top, which adds even harmonics.
++        Shaper::Hard => (driven + bias).clamp(-1.0, 1.0) - bias.clamp(-1.0, 1.0),
++        // Wavefolder around a fixed threshold of 1.0.
++        Shaper::Fold => hard_fold(driven, 1.0),
++    }
++}
++
++/// First-order DC-blocking high-pass (~20 Hz) that removes the DC component
++/// introduced by asymmetric distortion.
++///
++/// Without this filter a static offset would eat headroom and cause floating
++/// sub frequencies on a PA system.
++pub struct DcBlocker {
++    x1: f32,
++    y1: f32,
++}
++
++impl Default for DcBlocker {
++    fn default() -> Self {
++        Self { x1: 0.0, y1: 0.0 }
++    }
++}
++
++impl DcBlocker {
++    /// Clears the internal state (on plugin reset).
++    pub fn reset(&mut self) {
++        self.x1 = 0.0;
++        self.y1 = 0.0;
++    }
++
++    /// Processes a single sample. The coefficient `R` sets the cutoff frequency;
++    /// 0.9995 sits around 20 Hz at 44.1 kHz.
++    pub fn process(&mut self, x: f32) -> f32 {
++        const R: f32 = 0.9995;
++        let y = x - self.x1 + R * self.y1;
++        self.x1 = x;
++        self.y1 = y;
++        y
++    }
++}
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index 2872e46..592e2ce 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -1,5 +1,7 @@
++pub mod distortion;
+ pub mod envelope;
+ pub mod osc;
+ 
++pub use distortion::{shape, DcBlocker, Shaper};
+ pub use envelope::Envelope;
+ pub use osc::SineOsc;
+diff --git a/src/editor.rs b/src/editor.rs
+index df562c2..85eaf8e 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -1,3 +1,4 @@
++use crate::dsp::shape;
+ use crate::params::HardKickParams;
+ use nih_plug::prelude::Editor;
+ use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
+@@ -46,14 +47,23 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+             + (params.pitch_end.value() - params.pitch_start.value())
+                 * t_pitch.powf(params.curve.value());
+         let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value();
+-        wave.push((phase * TAU).sin() * amp);
++
++        // Mirror the audio path so the preview reflects the distortion settings.
++        let osc = (phase * TAU).sin();
++        let shaped = shape(
++            osc,
++            params.shaper.value(),
++            params.drive.value(),
++            params.bias.value(),
++        );
++        let mix = params.dist_mix.value();
++        let body = osc + (shaped - osc) * mix;
++        wave.push((body * amp).clamp(-1.0, 1.0));
+         phase = (phase + freq * step / sr).fract();
+     }
+ 
+-    let (rect, _) = ui.allocate_exact_size(
+-        egui::vec2(ui.available_width(), 80.0),
+-        egui::Sense::hover(),
+-    );
++    let (rect, _) =
++        ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+ 
+     if !ui.is_rect_visible(rect) {
+         return;
+@@ -160,6 +170,32 @@ pub fn create(
+                         ui.end_row();
+                     });
+ 
++                ui.add_space(4.0);
++                section_header(ui, "SHAPING");
++                ui.add_space(4.0);
++
++                egui::Grid::new("shaping_params")
++                    .num_columns(2)
++                    .min_col_width(90.0)
++                    .spacing([12.0, 6.0])
++                    .show(ui, |ui| {
++                        ui.label("Shaper");
++                        ui.add(widgets::ParamSlider::for_param(&params.shaper, setter));
++                        ui.end_row();
++
++                        ui.label("Drive");
++                        ui.add(widgets::ParamSlider::for_param(&params.drive, setter));
++                        ui.end_row();
++
++                        ui.label("Bias");
++                        ui.add(widgets::ParamSlider::for_param(&params.bias, setter));
++                        ui.end_row();
++
++                        ui.label("Mix");
++                        ui.add(widgets::ParamSlider::for_param(&params.dist_mix, setter));
++                        ui.end_row();
++                    });
++
+                 ui.add_space(4.0);
+                 section_header(ui, "SEQUENCER");
+                 ui.add_space(4.0);
+diff --git a/src/lib.rs b/src/lib.rs
+index d9f1a40..1015d2f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,7 @@ mod dsp;
+ mod editor;
+ mod params;
+ 
+-use dsp::{Envelope, SineOsc};
++use dsp::{shape, DcBlocker, Envelope, SineOsc};
+ use params::HardKickParams;
+ 
+ // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
+@@ -30,13 +30,14 @@ pub struct HardKick {
+     declick_counter: i32,
+     pending_trigger: bool,
+     pending_velocity: f32,
++    dc_blocker: DcBlocker,
+ }
+ 
+ impl Default for HardKick {
+     fn default() -> Self {
+         Self {
+             params: Arc::new(HardKickParams::default()),
+-            editor_state: EguiState::from_size(340, 470),
++            editor_state: EguiState::from_size(340, 600),
+             trigger: Arc::new(AtomicBool::new(false)),
+             playing: Arc::new(AtomicBool::new(false)),
+             osc: SineOsc::new(44_100.0),
+@@ -49,6 +50,7 @@ impl Default for HardKick {
+             declick_counter: 0,
+             pending_trigger: false,
+             pending_velocity: 1.0,
++            dc_blocker: DcBlocker::default(),
+         }
+     }
+ }
+@@ -125,6 +127,7 @@ impl Plugin for HardKick {
+         self.amp_env = Envelope::default();
+         self.declick_counter = 0;
+         self.pending_trigger = false;
++        self.dc_blocker.reset();
+     }
+ 
+     fn process(
+@@ -180,17 +183,37 @@ impl Plugin for HardKick {
+ 
+             // Synthesize.
+             let raw = if self.amp_env.is_active() {
+-                let pitch_t = self.pitch_env.tick(self.params.decay.value() * self.sample_rate);
++                let pitch_t = self
++                    .pitch_env
++                    .tick(self.params.decay.value() * self.sample_rate);
+                 let freq = lerp(
+                     self.params.pitch_start.value(),
+                     self.params.pitch_end.value(),
+                     pitch_t.powf(self.params.curve.value()),
+                 );
+-                let amp_t = self.amp_env.tick(self.params.amp_decay.value() * self.sample_rate);
++
++                // Waveshape the full-scale oscillator so the harmonic content stays
++                // consistent across the kick, then apply the amplitude envelope.
++                let osc = self.osc.tick(freq);
++                let shaped = shape(
++                    osc,
++                    self.params.shaper.value(),
++                    self.params.drive.value(),
++                    self.params.bias.value(),
++                );
++                let mix = self.params.dist_mix.value();
++                let body = self.dc_blocker.process(lerp(osc, shaped, mix));
++
++                let amp_t = self
++                    .amp_env
++                    .tick(self.params.amp_decay.value() * self.sample_rate);
+                 let amp = (1.0 - amp_t).powf(self.params.amp_curve.value())
+                     * self.velocity
+                     * self.params.level.value();
+-                self.osc.tick(freq) * amp
++
++                // Final safety clip; the shapers are already bounded, so this only
++                // catches extreme parameter combinations. A proper limiter comes later.
++                (body * amp).clamp(-1.0, 1.0)
+             } else {
+                 0.0
+             };
+diff --git a/src/params.rs b/src/params.rs
+index cc96490..3bc068f 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -1,3 +1,4 @@
++use crate::dsp::Shaper;
+ use nih_plug::prelude::*;
+ 
+ #[derive(Params)]
+@@ -30,6 +31,22 @@ pub struct HardKickParams {
+     #[id = "level"]
+     pub level: FloatParam,
+ 
++    /// Waveshaping model: sets the character of the distortion.
++    #[id = "shaper"]
++    pub shaper: EnumParam<Shaper>,
++
++    /// Distortion intensity (0.0 = clean, 1.0 = fully driven).
++    #[id = "drive"]
++    pub drive: FloatParam,
++
++    /// Distortion asymmetry — adds even harmonics for a thicker tone.
++    #[id = "bias"]
++    pub bias: FloatParam,
++
++    /// Dry/wet ratio of the distortion (0.0 = unprocessed, 1.0 = fully distorted).
++    #[id = "dist_mix"]
++    pub dist_mix: FloatParam,
++
+     /// Internal sequencer tempo in BPM.
+     #[id = "bpm"]
+     pub bpm: FloatParam,
+@@ -74,15 +91,8 @@ impl Default for HardKickParams {
+             .with_unit(" s")
+             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+-            curve: FloatParam::new(
+-                "Curve",
+-                2.0,
+-                FloatRange::Linear {
+-                    min: 0.1,
+-                    max: 8.0,
+-                },
+-            )
+-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++            curve: FloatParam::new("Curve", 2.0, FloatRange::Linear { min: 0.1, max: 8.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+             amp_decay: FloatParam::new(
+                 "Amp decay",
+@@ -96,22 +106,24 @@ impl Default for HardKickParams {
+             .with_unit(" s")
+             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+-            amp_curve: FloatParam::new(
+-                "Amp curve",
+-                1.0,
+-                FloatRange::Linear {
+-                    min: 0.1,
+-                    max: 8.0,
+-                },
+-            )
+-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++            amp_curve: FloatParam::new("Amp curve", 1.0, FloatRange::Linear { min: 0.1, max: 8.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+-            level: FloatParam::new(
+-                "Level",
+-                0.8,
+-                FloatRange::Linear { min: 0.0, max: 1.0 },
+-            )
+-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++            level: FloatParam::new("Level", 0.8, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            // Default Soft + drive 0.0 keeps the step-1 tone (clean sine) intact;
++            // the user dials in the hardness deliberately.
++            shaper: EnumParam::new("Shaper", Shaper::Soft),
++
++            drive: FloatParam::new("Drive", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            bias: FloatParam::new("Bias", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            dist_mix: FloatParam::new("Dist mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+             bpm: FloatParam::new(
+                 "BPM",
+-- 
+2.43.0
+

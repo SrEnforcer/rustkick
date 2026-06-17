@@ -9,7 +9,7 @@ mod dsp;
 mod editor;
 mod params;
 
-use dsp::{Envelope, SineOsc};
+use dsp::{shape, DcBlocker, Envelope, SineOsc};
 use params::HardKickParams;
 
 // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
@@ -30,13 +30,14 @@ pub struct HardKick {
     declick_counter: i32,
     pending_trigger: bool,
     pending_velocity: f32,
+    dc_blocker: DcBlocker,
 }
 
 impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(340, 470),
+            editor_state: EguiState::from_size(340, 600),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
@@ -49,6 +50,7 @@ impl Default for HardKick {
             declick_counter: 0,
             pending_trigger: false,
             pending_velocity: 1.0,
+            dc_blocker: DcBlocker::default(),
         }
     }
 }
@@ -125,6 +127,7 @@ impl Plugin for HardKick {
         self.amp_env = Envelope::default();
         self.declick_counter = 0;
         self.pending_trigger = false;
+        self.dc_blocker.reset();
     }
 
     fn process(
@@ -180,17 +183,37 @@ impl Plugin for HardKick {
 
             // Synthesize.
             let raw = if self.amp_env.is_active() {
-                let pitch_t = self.pitch_env.tick(self.params.decay.value() * self.sample_rate);
+                let pitch_t = self
+                    .pitch_env
+                    .tick(self.params.decay.value() * self.sample_rate);
                 let freq = lerp(
                     self.params.pitch_start.value(),
                     self.params.pitch_end.value(),
                     pitch_t.powf(self.params.curve.value()),
                 );
-                let amp_t = self.amp_env.tick(self.params.amp_decay.value() * self.sample_rate);
+
+                // Waveshape the full-scale oscillator so the harmonic content stays
+                // consistent across the kick, then apply the amplitude envelope.
+                let osc = self.osc.tick(freq);
+                let shaped = shape(
+                    osc,
+                    self.params.shaper.value(),
+                    self.params.drive.value(),
+                    self.params.bias.value(),
+                );
+                let mix = self.params.dist_mix.value();
+                let body = self.dc_blocker.process(lerp(osc, shaped, mix));
+
+                let amp_t = self
+                    .amp_env
+                    .tick(self.params.amp_decay.value() * self.sample_rate);
                 let amp = (1.0 - amp_t).powf(self.params.amp_curve.value())
                     * self.velocity
                     * self.params.level.value();
-                self.osc.tick(freq) * amp
+
+                // Final safety clip; the shapers are already bounded, so this only
+                // catches extreme parameter combinations. A proper limiter comes later.
+                (body * amp).clamp(-1.0, 1.0)
             } else {
                 0.0
             };
