@@ -283,6 +283,9 @@ pub fn create(
                     .min_col_width(90.0)
                     .spacing([12.0, 5.0])
                     .show(ui, |ui| {
+                        ui.label("Crossover");
+                        ui.add(widgets::ParamSlider::for_param(&params.crossover_freq, setter));
+                        ui.end_row();
                         ui.label("Drive");
                         ui.add(widgets::ParamSlider::for_param(&params.drive, setter));
                         ui.end_row();

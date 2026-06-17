@@ -83,6 +83,12 @@ pub struct HardKickParams {
     #[id = "click_tone"]
     pub click_tone: FloatParam,
 
+    /// Linkwitz-Riley crossover frequency — signal below this is passed clean to
+    /// the output; only the band above it goes through the distortion chain.
+    /// Keeps the sub-bass tight and undistorted while the upper body gets driven.
+    #[id = "crossover_freq"]
+    pub crossover_freq: FloatParam,
+
     /// Internal sequencer tempo in BPM.
     #[id = "bpm"]
     pub bpm: FloatParam,
@@ -234,6 +240,18 @@ impl Default for HardKickParams {
                 FloatRange::Skewed {
                     min: 200.0,
                     max: 8000.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+
+            crossover_freq: FloatParam::new(
+                "Crossover",
+                150.0,
+                FloatRange::Skewed {
+                    min: 60.0,
+                    max: 400.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )

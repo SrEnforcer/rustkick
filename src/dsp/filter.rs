@@ -120,4 +120,92 @@ impl BiquadFilter {
         self.z2 = self.b2 * x - self.a2 * y;
         y
     }
+
+    /// 2nd-order Butterworth lowpass (RBJ cookbook, Q = 1/√2 ≈ 0.7071).
+    pub fn set_lowpass_butterworth(&mut self, freq: f32, sample_rate: f32) {
+        let w0 = TAU * freq / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0_f32.sqrt());
+
+        let b0 = (1.0 - cos_w0) / 2.0;
+        let b1 = 1.0 - cos_w0;
+        let b2 = (1.0 - cos_w0) / 2.0;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        self.b0 = b0 / a0;
+        self.b1 = b1 / a0;
+        self.b2 = b2 / a0;
+        self.a1 = a1 / a0;
+        self.a2 = a2 / a0;
+    }
+
+    /// 2nd-order Butterworth highpass (RBJ cookbook, Q = 1/√2 ≈ 0.7071).
+    pub fn set_highpass_butterworth(&mut self, freq: f32, sample_rate: f32) {
+        let w0 = TAU * freq / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0_f32.sqrt());
+
+        let b0 = (1.0 + cos_w0) / 2.0;
+        let b1 = -(1.0 + cos_w0);
+        let b2 = (1.0 + cos_w0) / 2.0;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        self.b0 = b0 / a0;
+        self.b1 = b1 / a0;
+        self.b2 = b2 / a0;
+        self.a1 = a1 / a0;
+        self.a2 = a2 / a0;
+    }
+}
+
+/// 4th-order Linkwitz-Riley crossover — two cascaded 2nd-order Butterworth
+/// sections per band. The outputs sum to unity gain at all frequencies, with
+/// exactly 6 dB of attenuation at the crossover point for each band.
+pub struct LRCrossover {
+    lp1: BiquadFilter,
+    lp2: BiquadFilter,
+    hp1: BiquadFilter,
+    hp2: BiquadFilter,
+}
+
+impl Default for LRCrossover {
+    fn default() -> Self {
+        Self {
+            lp1: BiquadFilter::default(),
+            lp2: BiquadFilter::default(),
+            hp1: BiquadFilter::default(),
+            hp2: BiquadFilter::default(),
+        }
+    }
+}
+
+impl LRCrossover {
+    /// Update coefficients for the given crossover frequency. Call once per
+    /// buffer whenever the frequency parameter changes.
+    pub fn set_freq(&mut self, freq: f32, sample_rate: f32) {
+        self.lp1.set_lowpass_butterworth(freq, sample_rate);
+        self.lp2.set_lowpass_butterworth(freq, sample_rate);
+        self.hp1.set_highpass_butterworth(freq, sample_rate);
+        self.hp2.set_highpass_butterworth(freq, sample_rate);
+    }
+
+    /// Clears all delay lines.
+    pub fn reset(&mut self) {
+        self.lp1.reset();
+        self.lp2.reset();
+        self.hp1.reset();
+        self.hp2.reset();
+    }
+
+    /// Split one sample into `(sub, high)` bands.
+    #[inline]
+    pub fn process(&mut self, x: f32) -> (f32, f32) {
+        let sub = self.lp2.process(self.lp1.process(x));
+        let high = self.hp2.process(self.hp1.process(x));
+        (sub, high)
+    }
 }

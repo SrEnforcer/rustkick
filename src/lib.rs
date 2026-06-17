@@ -9,7 +9,7 @@ mod dsp;
 mod editor;
 mod params;
 
-use dsp::{shape, BiquadFilter, DcBlocker, Envelope, Noise, SineOsc};
+use dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Noise, SineOsc};
 use params::HardKickParams;
 
 // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
@@ -36,6 +36,7 @@ pub struct HardKick {
     noise: Noise,
     click_env: Envelope,
     click_hp: BiquadFilter,
+    crossover: LRCrossover,
 }
 
 impl Default for HardKick {
@@ -61,6 +62,7 @@ impl Default for HardKick {
             noise: Noise::default(),
             click_env: Envelope::default(),
             click_hp: BiquadFilter::default(),
+            crossover: LRCrossover::default(),
         }
     }
 }
@@ -148,6 +150,7 @@ impl Plugin for HardKick {
         self.post_eq.reset();
         self.click_env = Envelope::default();
         self.click_hp.reset();
+        self.crossover.reset();
     }
 
     fn process(
@@ -173,6 +176,8 @@ impl Plugin for HardKick {
             .set_highshelf(4000.0, self.params.tone.value(), self.sample_rate);
         self.click_hp
             .set_highpass(self.params.click_tone.value(), 0.707, self.sample_rate);
+        self.crossover
+            .set_freq(self.params.crossover_freq.value(), self.sample_rate);
 
         if !playing {
             self.beat_phase = 0.0;
@@ -226,11 +231,12 @@ impl Plugin for HardKick {
                 let end = self.params.pitch_end.value();
                 let freq = start * (end / start).powf(shaped_t);
 
-                // Signal path: osc → pre-EQ → shaper → DC block → post-EQ
-                // Pre-EQ boosts a narrow band before the saturator; the non-linearity
-                // then reacts asymmetrically to that band, generating the "screech".
+                // LR crossover splits the oscillator into sub and high bands.
+                // The sub band is passed clean; only the high band goes through
+                // the distortion chain so the sub-bass stays tight and undistorted.
                 let osc = self.osc.tick(freq);
-                let pre = self.pre_eq.process(osc);
+                let (sub, high) = self.crossover.process(osc);
+                let pre = self.pre_eq.process(high);
                 let shaped = shape(
                     pre,
                     self.params.shaper.value(),
@@ -238,9 +244,10 @@ impl Plugin for HardKick {
                     self.params.bias.value(),
                 );
                 let mix = self.params.dist_mix.value();
-                let body = self
+                let driven = self
                     .post_eq
                     .process(self.dc_blocker.process(lerp(pre, shaped, mix)));
+                let body = sub + driven;
 
                 let amp_t = self
                     .amp_env
