@@ -1,0 +1,1309 @@
+From 2ea48c264142cbe7abf4ebe361d6ec9469546eff Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 17 Jun 2026 19:56:07 +0000
+Subject: [PATCH 1/2] Add waveshaping distortion stage (milestone 2)
+
+Introduce the first non-linear distortion stage so the synth can actually
+produce a hard kick instead of a pure sine.
+
+- New dsp/distortion module: Soft (tanh), Hard (clip) and Fold (wavefolder)
+  shapers, plus a one-pole DC blocker for the offset asymmetric shaping adds.
+- New params: Shaper, Drive, Bias and Dist mix. Defaults (Soft, drive 0.0)
+  preserve the milestone-1 clean-sine sound.
+- Wire shaping into the process loop before the amplitude envelope, with a
+  final safety clip on the output.
+- Add a SHAPING section to the editor and make the waveform preview reflect
+  the distortion settings.
+- Document the milestone in docs/design/step2.distortion.md.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GwURq9bT1AzMqUHKVyWkmv
+---
+ docs/design/step2.distortion.md |  94 +++++++++++++++++++++++++++++
+ src/dsp/distortion.rs           | 102 ++++++++++++++++++++++++++++++++
+ src/dsp/mod.rs                  |   2 +
+ src/editor.rs                   |  46 ++++++++++++--
+ src/lib.rs                      |  33 +++++++++--
+ src/params.rs                   |  60 +++++++++++--------
+ 6 files changed, 303 insertions(+), 34 deletions(-)
+ create mode 100644 docs/design/step2.distortion.md
+ create mode 100644 src/dsp/distortion.rs
+
+diff --git a/docs/design/step2.distortion.md b/docs/design/step2.distortion.md
+new file mode 100644
+index 0000000..7e7303c
+--- /dev/null
++++ b/docs/design/step2.distortion.md
+@@ -0,0 +1,94 @@
++# hardkick — milestone 2: waveshaping / distortion
++
++Building on milestone 1 (a triggerable, pitched sine sweep), this step adds the
++single most important ingredient for a "hard" kick: **non-linear distortion**.
++
++A pure sine has no harmonics, so no amount of pitch- or amplitude-shaping can
++make it sound hard. Hardness *is* harmonic content, and harmonics come from
++waveshaping. This milestone introduces a small, real-time-safe distortion stage
++plus a DC blocker, and exposes it through the UI and the waveform preview.
++
++No extra layers, no EQ, no oversampling yet — those are later milestones.
++
++---
++
++## Goal
++
++- A selectable waveshaper (`Soft` / `Hard` / `Fold`) applied to the oscillator.
++- `Drive`, `Bias` and `Mix` controls to dial the distortion from clean to extreme.
++- A DC-blocking high-pass to remove the offset that asymmetric shaping creates.
++- The waveform preview reflects the distortion so the shape is visible at a glance.
++- Defaults preserve the milestone-1 sound (clean sine) so nothing changes until
++  the user turns up `Drive`.
++
++---
++
++## DSP design
++
++### Signal order (per sample)
++
++```
++osc → waveshape(drive, bias) → dry/wet mix → DC blocker → × amp envelope → safety clip
++```
++
++The oscillator is shaped at full scale *before* the amplitude envelope is
++applied, so the harmonic content stays consistent across the whole kick instead
++of changing with the decay level.
++
++### Shapers (`src/dsp/distortion.rs`)
++
++- **Soft** — asymmetric `tanh`: `(x·g + b).tanh() − b.tanh()`. Odd harmonics, with
++  even harmonics added as `bias` increases. The subtraction removes the resting
++  DC offset the bias introduces.
++- **Hard** — asymmetric hard clip: `(x·g + b).clamp(−1, 1) − b.clamp(−1, 1)`. Sharp,
++  square character.
++- **Fold** — a wavefolder (`hard_fold`) that mirrors the signal back over a
++  threshold, producing dense, metallic rawstyle overtones.
++
++`drive` (0..1) maps to an input gain of `1 + drive·24`. All three shapers are
++inherently bounded to ≈[−1, 1].
++
++### DC blocker
++
++A first-order high-pass (`y = x − x₁ + R·y₁`, `R = 0.9995`, ≈20 Hz at 44.1 kHz)
++sits right after shaping. Asymmetric distortion produces a DC offset that would
++otherwise eat headroom and cause floating sub frequencies on a PA.
++
++### Output safety
++
++A final `clamp(−1, 1)` guards against extreme parameter combinations. The shapers
++are already bounded, so this is only a safety net — a proper brickwall limiter is
++milestone 4.
++
++---
++
++## Parameters added (`src/params.rs`)
++
++| Param      | Range      | Default | Notes                                  |
++|------------|------------|---------|----------------------------------------|
++| `shaper`   | Soft/Hard/Fold | Soft | Waveshaping model                      |
++| `drive`    | 0.0 – 1.0  | 0.0     | Distortion intensity (0 = clean)       |
++| `bias`     | 0.0 – 1.0  | 0.0     | Asymmetry → even harmonics             |
++| `dist_mix` | 0.0 – 1.0  | 1.0     | Dry/wet of the distorted signal        |
++
++---
++
++## Definition of done
++
++- `cargo build --release` compiles the `cdylib` and standalone without errors.
++- With `Drive = 0` the kick is identical to milestone 1 (clean sine).
++- Raising `Drive` audibly adds harmonics; `Shaper` changes the character and
++  `Bias` thickens the tone.
++- The waveform preview visibly squares off / folds as distortion increases.
++- No heap allocation in the process loop (guarded by `assert_process_alloc`).
++
++---
++
++## Next milestones (not implemented yet)
++
++1. Pre-/post-distortion biquad EQ (the rawstyle "screech" resonance peak).
++2. Click/attack layer (noise burst or separate oscillator) for the "tok".
++3. Linkwitz-Riley crossover to protect the sub from the distortion.
++4. Brickwall limiter on the output.
++5. Oversampling (2×/4×) around the shaper to control aliasing.
++6. Headless offline render to `.wav` for preview generation.
+diff --git a/src/dsp/distortion.rs b/src/dsp/distortion.rs
+new file mode 100644
+index 0000000..fbd9f6d
+--- /dev/null
++++ b/src/dsp/distortion.rs
+@@ -0,0 +1,102 @@
++use nih_plug::prelude::Enum;
++
++/// Waveshaping model that determines which kind of harmonics the distortion generates.
++///
++/// The choice between symmetric and asymmetric shaping is the difference between a
++/// hollow, square hardstyle tone (odd harmonics) and a richer, more aggressive
++/// rawstyle tone (both even and odd harmonics).
++#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Shaper {
++    /// Symmetric soft clip (`tanh`) — odd harmonics, rounded saturation.
++    #[name = "Soft"]
++    Soft,
++    /// Hard clip — sharp, square distortion with strong odd harmonics.
++    #[name = "Hard"]
++    Hard,
++    /// Wavefolder — folds the signal back to carve metallic overtones (rawstyle).
++    #[name = "Fold"]
++    Fold,
++}
++
++/// Folds the signal back over a threshold an arbitrary number of times.
++///
++/// Unlike clipping (which caps the peak), a wavefolder mirrors the amplitude,
++/// producing a very dense harmonic structure. Adapted from the design report
++/// (DSP math of the hardstyle kick).
++fn hard_fold(input: f32, threshold: f32) -> f32 {
++    let sign = input.signum();
++    let x = input.abs();
++
++    if x > threshold {
++        let remainder = x % threshold;
++        let num_folds = (x / threshold).floor() as i32;
++        let y = if num_folds % 2 == 0 {
++            remainder
++        } else {
++            threshold - remainder
++        };
++        y * sign
++    } else {
++        input
++    }
++}
++
++/// Shapes a single sample according to the selected model.
++///
++/// `drive` (0.0..=1.0) controls the intensity and `bias` (0.0..=1.0) introduces
++/// asymmetry. A bias above zero shifts the operating point on the non-linear curve,
++/// generating even harmonics for a thicker, warmer tone. The output is always
++/// bounded to roughly [-1.0, 1.0].
++pub fn shape(x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
++    // Map drive to a usable input gain.
++    let gain = 1.0 + drive * 24.0;
++    let driven = x * gain;
++
++    match mode {
++        // Asymmetric tanh; the subtraction removes the resting DC offset that the
++        // bias introduces (a dedicated DC blocker downstream is still desirable).
++        Shaper::Soft => {
++            let b = bias * 0.9;
++            (driven + b).tanh() - b.tanh()
++        }
++        // Hard clip with asymmetric thresholds: a positive bias makes the bottom
++        // clip sooner than the top, which adds even harmonics.
++        Shaper::Hard => (driven + bias).clamp(-1.0, 1.0) - bias.clamp(-1.0, 1.0),
++        // Wavefolder around a fixed threshold of 1.0.
++        Shaper::Fold => hard_fold(driven, 1.0),
++    }
++}
++
++/// First-order DC-blocking high-pass (~20 Hz) that removes the DC component
++/// introduced by asymmetric distortion.
++///
++/// Without this filter a static offset would eat headroom and cause floating
++/// sub frequencies on a PA system.
++pub struct DcBlocker {
++    x1: f32,
++    y1: f32,
++}
++
++impl Default for DcBlocker {
++    fn default() -> Self {
++        Self { x1: 0.0, y1: 0.0 }
++    }
++}
++
++impl DcBlocker {
++    /// Clears the internal state (on plugin reset).
++    pub fn reset(&mut self) {
++        self.x1 = 0.0;
++        self.y1 = 0.0;
++    }
++
++    /// Processes a single sample. The coefficient `R` sets the cutoff frequency;
++    /// 0.9995 sits around 20 Hz at 44.1 kHz.
++    pub fn process(&mut self, x: f32) -> f32 {
++        const R: f32 = 0.9995;
++        let y = x - self.x1 + R * self.y1;
++        self.x1 = x;
++        self.y1 = y;
++        y
++    }
++}
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index 2872e46..592e2ce 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -1,5 +1,7 @@
++pub mod distortion;
+ pub mod envelope;
+ pub mod osc;
+ 
++pub use distortion::{shape, DcBlocker, Shaper};
+ pub use envelope::Envelope;
+ pub use osc::SineOsc;
+diff --git a/src/editor.rs b/src/editor.rs
+index df562c2..85eaf8e 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -1,3 +1,4 @@
++use crate::dsp::shape;
+ use crate::params::HardKickParams;
+ use nih_plug::prelude::Editor;
+ use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
+@@ -46,14 +47,23 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+             + (params.pitch_end.value() - params.pitch_start.value())
+                 * t_pitch.powf(params.curve.value());
+         let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value();
+-        wave.push((phase * TAU).sin() * amp);
++
++        // Mirror the audio path so the preview reflects the distortion settings.
++        let osc = (phase * TAU).sin();
++        let shaped = shape(
++            osc,
++            params.shaper.value(),
++            params.drive.value(),
++            params.bias.value(),
++        );
++        let mix = params.dist_mix.value();
++        let body = osc + (shaped - osc) * mix;
++        wave.push((body * amp).clamp(-1.0, 1.0));
+         phase = (phase + freq * step / sr).fract();
+     }
+ 
+-    let (rect, _) = ui.allocate_exact_size(
+-        egui::vec2(ui.available_width(), 80.0),
+-        egui::Sense::hover(),
+-    );
++    let (rect, _) =
++        ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+ 
+     if !ui.is_rect_visible(rect) {
+         return;
+@@ -160,6 +170,32 @@ pub fn create(
+                         ui.end_row();
+                     });
+ 
++                ui.add_space(4.0);
++                section_header(ui, "SHAPING");
++                ui.add_space(4.0);
++
++                egui::Grid::new("shaping_params")
++                    .num_columns(2)
++                    .min_col_width(90.0)
++                    .spacing([12.0, 6.0])
++                    .show(ui, |ui| {
++                        ui.label("Shaper");
++                        ui.add(widgets::ParamSlider::for_param(&params.shaper, setter));
++                        ui.end_row();
++
++                        ui.label("Drive");
++                        ui.add(widgets::ParamSlider::for_param(&params.drive, setter));
++                        ui.end_row();
++
++                        ui.label("Bias");
++                        ui.add(widgets::ParamSlider::for_param(&params.bias, setter));
++                        ui.end_row();
++
++                        ui.label("Mix");
++                        ui.add(widgets::ParamSlider::for_param(&params.dist_mix, setter));
++                        ui.end_row();
++                    });
++
+                 ui.add_space(4.0);
+                 section_header(ui, "SEQUENCER");
+                 ui.add_space(4.0);
+diff --git a/src/lib.rs b/src/lib.rs
+index d9f1a40..1015d2f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,7 @@ mod dsp;
+ mod editor;
+ mod params;
+ 
+-use dsp::{Envelope, SineOsc};
++use dsp::{shape, DcBlocker, Envelope, SineOsc};
+ use params::HardKickParams;
+ 
+ // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
+@@ -30,13 +30,14 @@ pub struct HardKick {
+     declick_counter: i32,
+     pending_trigger: bool,
+     pending_velocity: f32,
++    dc_blocker: DcBlocker,
+ }
+ 
+ impl Default for HardKick {
+     fn default() -> Self {
+         Self {
+             params: Arc::new(HardKickParams::default()),
+-            editor_state: EguiState::from_size(340, 470),
++            editor_state: EguiState::from_size(340, 600),
+             trigger: Arc::new(AtomicBool::new(false)),
+             playing: Arc::new(AtomicBool::new(false)),
+             osc: SineOsc::new(44_100.0),
+@@ -49,6 +50,7 @@ impl Default for HardKick {
+             declick_counter: 0,
+             pending_trigger: false,
+             pending_velocity: 1.0,
++            dc_blocker: DcBlocker::default(),
+         }
+     }
+ }
+@@ -125,6 +127,7 @@ impl Plugin for HardKick {
+         self.amp_env = Envelope::default();
+         self.declick_counter = 0;
+         self.pending_trigger = false;
++        self.dc_blocker.reset();
+     }
+ 
+     fn process(
+@@ -180,17 +183,37 @@ impl Plugin for HardKick {
+ 
+             // Synthesize.
+             let raw = if self.amp_env.is_active() {
+-                let pitch_t = self.pitch_env.tick(self.params.decay.value() * self.sample_rate);
++                let pitch_t = self
++                    .pitch_env
++                    .tick(self.params.decay.value() * self.sample_rate);
+                 let freq = lerp(
+                     self.params.pitch_start.value(),
+                     self.params.pitch_end.value(),
+                     pitch_t.powf(self.params.curve.value()),
+                 );
+-                let amp_t = self.amp_env.tick(self.params.amp_decay.value() * self.sample_rate);
++
++                // Waveshape the full-scale oscillator so the harmonic content stays
++                // consistent across the kick, then apply the amplitude envelope.
++                let osc = self.osc.tick(freq);
++                let shaped = shape(
++                    osc,
++                    self.params.shaper.value(),
++                    self.params.drive.value(),
++                    self.params.bias.value(),
++                );
++                let mix = self.params.dist_mix.value();
++                let body = self.dc_blocker.process(lerp(osc, shaped, mix));
++
++                let amp_t = self
++                    .amp_env
++                    .tick(self.params.amp_decay.value() * self.sample_rate);
+                 let amp = (1.0 - amp_t).powf(self.params.amp_curve.value())
+                     * self.velocity
+                     * self.params.level.value();
+-                self.osc.tick(freq) * amp
++
++                // Final safety clip; the shapers are already bounded, so this only
++                // catches extreme parameter combinations. A proper limiter comes later.
++                (body * amp).clamp(-1.0, 1.0)
+             } else {
+                 0.0
+             };
+diff --git a/src/params.rs b/src/params.rs
+index cc96490..3bc068f 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -1,3 +1,4 @@
++use crate::dsp::Shaper;
+ use nih_plug::prelude::*;
+ 
+ #[derive(Params)]
+@@ -30,6 +31,22 @@ pub struct HardKickParams {
+     #[id = "level"]
+     pub level: FloatParam,
+ 
++    /// Waveshaping model: sets the character of the distortion.
++    #[id = "shaper"]
++    pub shaper: EnumParam<Shaper>,
++
++    /// Distortion intensity (0.0 = clean, 1.0 = fully driven).
++    #[id = "drive"]
++    pub drive: FloatParam,
++
++    /// Distortion asymmetry — adds even harmonics for a thicker tone.
++    #[id = "bias"]
++    pub bias: FloatParam,
++
++    /// Dry/wet ratio of the distortion (0.0 = unprocessed, 1.0 = fully distorted).
++    #[id = "dist_mix"]
++    pub dist_mix: FloatParam,
++
+     /// Internal sequencer tempo in BPM.
+     #[id = "bpm"]
+     pub bpm: FloatParam,
+@@ -74,15 +91,8 @@ impl Default for HardKickParams {
+             .with_unit(" s")
+             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+-            curve: FloatParam::new(
+-                "Curve",
+-                2.0,
+-                FloatRange::Linear {
+-                    min: 0.1,
+-                    max: 8.0,
+-                },
+-            )
+-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++            curve: FloatParam::new("Curve", 2.0, FloatRange::Linear { min: 0.1, max: 8.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+             amp_decay: FloatParam::new(
+                 "Amp decay",
+@@ -96,22 +106,24 @@ impl Default for HardKickParams {
+             .with_unit(" s")
+             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+-            amp_curve: FloatParam::new(
+-                "Amp curve",
+-                1.0,
+-                FloatRange::Linear {
+-                    min: 0.1,
+-                    max: 8.0,
+-                },
+-            )
+-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++            amp_curve: FloatParam::new("Amp curve", 1.0, FloatRange::Linear { min: 0.1, max: 8.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+-            level: FloatParam::new(
+-                "Level",
+-                0.8,
+-                FloatRange::Linear { min: 0.0, max: 1.0 },
+-            )
+-            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++            level: FloatParam::new("Level", 0.8, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            // Default Soft + drive 0.0 keeps the step-1 tone (clean sine) intact;
++            // the user dials in the hardness deliberately.
++            shaper: EnumParam::new("Shaper", Shaper::Soft),
++
++            drive: FloatParam::new("Drive", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            bias: FloatParam::new("Bias", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            dist_mix: FloatParam::new("Dist mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
++                .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
+             bpm: FloatParam::new(
+                 "BPM",
+-- 
+2.43.0
+
+
+From 77bc4d4e7af845e7f373b285931dbbb27ad5a13d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 17 Jun 2026 20:09:48 +0000
+Subject: [PATCH 2/2] Add pre/post EQ, segmented shaper switch, and dark UI
+ theme (milestone 3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DSP:
+- New dsp/filter.rs: biquad filter (Direct Form II Transposed) with peaking EQ
+  and high-shelf modes. Coefficients recomputed once per buffer.
+- Signal path is now: osc → pre-EQ peak → shaper → DC block → post-EQ shelf → amp.
+- Pre-EQ boost into the saturator generates the rawstyle "screech"; high-shelf
+  post-EQ tames harshness. Both default to 0 dB (acoustically transparent).
+- New params: pre_eq_freq, pre_eq_q, pre_eq_gain, tone.
+
+UI:
+- Custom segmented switch (pill shape) for the shaper model replaces the slider.
+  Active segment glows with accent colour + dot indicator; inactive segments dim.
+- Global dark egui theme applied via set_style on init.
+- New EQ section in the editor with Screech Hz / Q / dB and Tone controls.
+- Section headers now use monospace font and accent colour for a cleaner look.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GwURq9bT1AzMqUHKVyWkmv
+---
+ docs/design/step3.eq.md | 102 ++++++++++++++++++++
+ src/dsp/filter.rs       | 100 +++++++++++++++++++
+ src/dsp/mod.rs          |   2 +
+ src/editor.rs           | 206 +++++++++++++++++++++++++++++++---------
+ src/lib.rs              |  32 +++++--
+ src/params.rs           |  71 ++++++++++++++
+ 6 files changed, 464 insertions(+), 49 deletions(-)
+ create mode 100644 docs/design/step3.eq.md
+ create mode 100644 src/dsp/filter.rs
+
+diff --git a/docs/design/step3.eq.md b/docs/design/step3.eq.md
+new file mode 100644
+index 0000000..e8cbb3d
+--- /dev/null
++++ b/docs/design/step3.eq.md
+@@ -0,0 +1,102 @@
++# hardkick — milestone 3: pre/post EQ + UI segmented switch
++
++Building on milestone 2 (waveshaping), this step adds the frequency-sculpting
++layer that turns a merely-distorted sine into a genuine rawstyle kick.
++
++---
++
++## Goal
++
++- A biquad **peaking EQ before the distortion** (the "screech" generator).
++- A **high-shelf tone control after the distortion** to tame harshness.
++- A custom **segmented switch** in the UI for the shaper model instead of a slider.
++- A consistent **dark themed** egui style applied globally.
++
++---
++
++## DSP design
++
++### Full signal path (per sample)
++
++```
++osc → pre-EQ (peak) → shaper → DC blocker → post-EQ (shelf) → × amp env → clip
++```
++
++### Pre-EQ — the screech mechanism
++
++A peaking biquad (Q = 0.5–10, gain 0–24 dB) sits immediately before the
++saturator. Because the distortion is non-linear, only the boosted frequency band
++is clipped hard — generating dense harmonics *around* that specific frequency.
++This is the mechanism behind the iconic rawstyle screech.
++
++- **Screech Hz** (200–8000 Hz): sets which overtone is excited.
++- **Screech Q**: narrower = more surgical / more intense.
++- **Screech dB**: 0 = neutral (pre-EQ is acoustically bypassed at 0 dB gain).
++
++Typical starting point: 2–3 kHz, Q 4–6, gain 12–18 dB with Hard or Fold shaper.
++
++### Post-EQ — tone control
++
++A high-shelf filter fixed at 4 kHz, ±18/+6 dB range. Negative values pull back
++harshness from the distortion; positive values add top-end brightness.
++Set to 0 dB by default (identity).
++
++### Biquad implementation (`src/dsp/filter.rs`)
++
++Direct Form II Transposed — stable under high-Q and high-gain settings.
++Coefficients are recomputed once per buffer (not per sample), which is both cheap
++and avoids branching in the hot path.
++
++---
++
++## UI design
++
++### Segmented switch (`shaper_switch` in `editor.rs`)
++
++The shaper previously used an opaque slider over an enum. Three discrete options
++deserve a three-way hardware-style toggle:
++
++- Pill-shaped container with a dim outline.
++- Each segment can be clicked to select. Active segment has:
++  - A filled accent-coloured background.
++  - A small glow dot at the top.
++  - Bright text label.
++- Inactive segments are dark with muted text.
++
++### Dark theme
++
++A global egui style override sets panel background, widget fills, and accent
++colours consistently. All custom-painted widgets share the same `ACCENT` /
++`ACCENT_DIM` / `PANEL_BG` / `SECTION_BG` constants.
++
++---
++
++## Parameters added
++
++| Param         | Range           | Default | Notes                              |
++|---------------|-----------------|---------|------------------------------------|
++| `pre_eq_freq` | 200–8000 Hz     | 2000 Hz | Screech centre frequency           |
++| `pre_eq_q`    | 0.5–10          | 3.0     | Peak bandwidth                     |
++| `pre_eq_gain` | 0–24 dB         | 0 dB    | 0 = pre-EQ is neutral              |
++| `tone`        | −18 to +6 dB   | 0 dB    | Post-distortion high-shelf         |
++
++---
++
++## Definition of done
++
++- `cargo build --release` compiles without errors.
++- With `pre_eq_gain = 0` and `tone = 0` the sound is identical to milestone 2.
++- Raising `Screech dB` + a Hard/Fold shaper + Drive > 0.5 produces an audible
++  resonant screech character.
++- The shaper switch displays correctly: active segment glows, clicking changes mode.
++- The dark theme applies uniformly across all UI sections.
++
++---
++
++## Next milestones
++
++1. Exponential pitch envelope (logarithmic Hz interpolation — see design doc p.4).
++2. Click/attack layer — a short noise burst or separate high-frequency oscillator for the "tok".
++3. Linkwitz-Riley crossover to protect the sub from the distortion.
++4. Brickwall limiter on the output.
++5. Oversampling (2×/4×) around the waveshaper to suppress aliasing.
+diff --git a/src/dsp/filter.rs b/src/dsp/filter.rs
+new file mode 100644
+index 0000000..c4b643b
+--- /dev/null
++++ b/src/dsp/filter.rs
+@@ -0,0 +1,100 @@
++use std::f32::consts::TAU;
++
++/// Biquad filter in Direct Form II Transposed — numerically stable under
++/// high-Q and high-gain settings.
++///
++/// Supports peaking EQ and high-shelf modes. Coefficients are recomputed
++/// lazily via `set_peaking` / `set_highshelf` and cached until changed.
++pub struct BiquadFilter {
++    b0: f32,
++    b1: f32,
++    b2: f32,
++    a1: f32,
++    a2: f32,
++    // Delay elements.
++    z1: f32,
++    z2: f32,
++}
++
++impl Default for BiquadFilter {
++    fn default() -> Self {
++        // Identity (pass-through) on construction.
++        Self {
++            b0: 1.0,
++            b1: 0.0,
++            b2: 0.0,
++            a1: 0.0,
++            a2: 0.0,
++            z1: 0.0,
++            z2: 0.0,
++        }
++    }
++}
++
++impl BiquadFilter {
++    /// Clears the delay line (call on plugin reset / retrigger if needed).
++    pub fn reset(&mut self) {
++        self.z1 = 0.0;
++        self.z2 = 0.0;
++    }
++
++    /// Peaking EQ band — boosts/cuts `gain_db` around `freq` with bandwidth `q`.
++    ///
++    /// A high Q (e.g. 3–8) with a strong boost fed into a distortion stage is
++    /// what produces the rawstyle "screech": the saturator amplifies only that
++    /// narrow band nonlinearly.
++    pub fn set_peaking(&mut self, freq: f32, q: f32, gain_db: f32, sample_rate: f32) {
++        let a = 10.0_f32.powf(gain_db / 40.0);
++        let w0 = TAU * freq / sample_rate;
++        let alpha = w0.sin() / (2.0 * q);
++
++        let b0 = 1.0 + alpha * a;
++        let b1 = -2.0 * w0.cos();
++        let b2 = 1.0 - alpha * a;
++        let a0 = 1.0 + alpha / a;
++        let a1 = -2.0 * w0.cos();
++        let a2 = 1.0 - alpha / a;
++
++        self.b0 = b0 / a0;
++        self.b1 = b1 / a0;
++        self.b2 = b2 / a0;
++        self.a1 = a1 / a0;
++        self.a2 = a2 / a0;
++    }
++
++    /// High-shelf filter — boosts/cuts everything above `freq` by `gain_db`.
++    ///
++    /// Used as a post-distortion "Tone" control to rein in harshness.
++    pub fn set_highshelf(&mut self, freq: f32, gain_db: f32, sample_rate: f32) {
++        let a = 10.0_f32.powf(gain_db / 40.0);
++        let w0 = TAU * freq / sample_rate;
++        let cos_w0 = w0.cos();
++        let sin_w0 = w0.sin();
++        // S = 1 (shelf slope = 1 gives a smooth transition).
++        let alpha = sin_w0 / 2.0 * ((a + 1.0 / a) * (1.0 - 1.0) + 2.0).sqrt();
++        // Fallback to a gentle slope when alpha comes out ≤ 0.
++        let alpha = if alpha > 0.0 { alpha } else { sin_w0 * 0.5 };
++
++        let b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + 2.0 * a.sqrt() * alpha);
++        let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0);
++        let b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - 2.0 * a.sqrt() * alpha);
++        let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + 2.0 * a.sqrt() * alpha;
++        let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
++        let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - 2.0 * a.sqrt() * alpha;
++
++        self.b0 = b0 / a0;
++        self.b1 = b1 / a0;
++        self.b2 = b2 / a0;
++        self.a1 = a1 / a0;
++        self.a2 = a2 / a0;
++    }
++
++    /// Processes a single sample through the biquad.
++    #[inline]
++    pub fn process(&mut self, x: f32) -> f32 {
++        let y = self.b0 * x + self.z1;
++        self.z1 = self.b1 * x - self.a1 * y + self.z2;
++        self.z2 = self.b2 * x - self.a2 * y;
++        y
++    }
++}
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index 592e2ce..e17c8b5 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -1,7 +1,9 @@
+ pub mod distortion;
+ pub mod envelope;
++pub mod filter;
+ pub mod osc;
+ 
+ pub use distortion::{shape, DcBlocker, Shaper};
+ pub use envelope::Envelope;
++pub use filter::BiquadFilter;
+ pub use osc::SineOsc;
+diff --git a/src/editor.rs b/src/editor.rs
+index 85eaf8e..465d17f 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -1,6 +1,8 @@
+-use crate::dsp::shape;
++use crate::dsp::{shape, Shaper};
+ use crate::params::HardKickParams;
++use nih_plug::context::gui::ParamSetter;
+ use nih_plug::prelude::Editor;
++use nih_plug_egui::egui::epaint::StrokeKind;
+ use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
+ use std::f32::consts::TAU;
+ use std::sync::{
+@@ -8,33 +10,125 @@ use std::sync::{
+     Arc,
+ };
+ 
++// Accent colours reused throughout the UI.
++const ACCENT: egui::Color32 = egui::Color32::from_rgb(160, 120, 220);
++const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(80, 55, 120);
++const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(20, 16, 32);
++const SECTION_BG: egui::Color32 = egui::Color32::from_rgb(30, 24, 46);
++
+ fn section_header(ui: &mut egui::Ui, label: &str) {
+     let width = ui.available_width();
+     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
+     if ui.is_rect_visible(rect) {
+-        let fill = ui.visuals().widgets.noninteractive.bg_fill;
+-        let text_color = ui.visuals().widgets.noninteractive.fg_stroke.color;
+-        ui.painter().rect_filled(rect, 2.0, fill);
++        ui.painter().rect_filled(rect, 2.0, SECTION_BG);
+         ui.painter().text(
+             rect.center(),
+             egui::Align2::CENTER_CENTER,
+             label,
+-            egui::FontId::proportional(11.0),
++            egui::FontId::monospace(10.0),
++            ACCENT,
++        );
++    }
++}
++
++/// Three-way segmented toggle switch for an `EnumParam<Shaper>`.
++///
++/// Renders as three labelled illuminated segments in a pill shape. The active
++/// segment glows with the accent colour; inactive segments are dim. Clicking
++/// any segment sets the parameter immediately.
++fn shaper_switch(
++    ui: &mut egui::Ui,
++    current: Shaper,
++    setter: &ParamSetter,
++    param: &nih_plug::prelude::EnumParam<Shaper>,
++) {
++    let options: &[(Shaper, &str)] = &[
++        (Shaper::Soft, "SOFT"),
++        (Shaper::Hard, "HARD"),
++        (Shaper::Fold, "FOLD"),
++    ];
++
++    let total_width = ui.available_width();
++    let height = 26.0;
++    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_width, height), egui::Sense::hover());
++
++    if !ui.is_rect_visible(rect) {
++        return;
++    }
++
++    let seg_w = total_width / options.len() as f32;
++    let painter = ui.painter_at(rect);
++    let corner = height * 0.4;
++
++    // Outer pill outline.
++    painter.rect_stroke(
++        rect,
++        corner,
++        egui::Stroke::new(1.0, ACCENT_DIM),
++        StrokeKind::Outside,
++    );
++
++    for (idx, &(variant, label)) in options.iter().enumerate() {
++        let x = rect.left() + idx as f32 * seg_w;
++        let seg_rect =
++            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg_w, height));
++
++        let is_active = current == variant;
++        let fill = if is_active { ACCENT_DIM } else { PANEL_BG };
++        let text_color = if is_active {
++            ACCENT
++        } else {
++            egui::Color32::from_rgb(120, 100, 160)
++        };
++
++        // Round only the outer corners of the pill.
++        let seg_corner = if idx == 0 || idx == options.len() - 1 {
++            corner
++        } else {
++            0.0
++        };
++        painter.rect_filled(seg_rect.shrink(0.5), seg_corner, fill);
++
++        // Inner segment dividers.
++        if idx > 0 {
++            painter.line_segment(
++                [seg_rect.left_top(), seg_rect.left_bottom()],
++                egui::Stroke::new(1.0, ACCENT_DIM),
++            );
++        }
++
++        // Glow dot above the label when active.
++        if is_active {
++            let dot_center = egui::pos2(seg_rect.center().x, seg_rect.top() + 5.0);
++            painter.circle_filled(dot_center, 2.5, ACCENT);
++        }
++
++        painter.text(
++            seg_rect.center() + egui::vec2(0.0, if is_active { 1.5 } else { 0.0 }),
++            egui::Align2::CENTER_CENTER,
++            label,
++            egui::FontId::monospace(9.5),
+             text_color,
+         );
++
++        // Click handling.
++        let response = ui.interact(seg_rect, ui.id().with(idx), egui::Sense::click());
++        if response.clicked() && !is_active {
++            setter.begin_set_parameter(param);
++            setter.set_parameter(param, variant);
++            setter.end_set_parameter(param);
++        }
+     }
+ }
+ 
+-/// Renders a preview of the kick waveform derived from the current parameter values.
+-/// Simulates N evenly-spaced samples over the full amplitude decay duration and draws
+-/// the result as a polyline so the user can see the pitch sweep and envelope shape at a glance.
++/// Renders a waveform preview that mirrors the full audio signal path including
++/// distortion and EQ, so changes to any parameter are reflected immediately.
+ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+-    const N: usize = 256;
++    const N: usize = 512;
+     let sr = 44_100.0_f32;
+ 
+     let amp_samples = params.amp_decay.value() * sr;
+     let pitch_samples = params.decay.value() * sr;
+-    // Each simulated point covers this many real samples.
+     let step = amp_samples / N as f32;
+ 
+     let mut phase = 0.0_f32;
+@@ -48,8 +142,9 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+                 * t_pitch.powf(params.curve.value());
+         let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value();
+ 
+-        // Mirror the audio path so the preview reflects the distortion settings.
+         let osc = (phase * TAU).sin();
++        // The preview doesn't run the biquad (no filter state available here), but
++        // shaping is cheap to replicate so the visual at least shows the wavefolder/clipper.
+         let shaped = shape(
+             osc,
+             params.shaper.value(),
+@@ -70,19 +165,17 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+     }
+ 
+     let painter = ui.painter_at(rect);
+-    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(20, 16, 32));
++    painter.rect_filled(rect, 4.0, PANEL_BG);
+ 
+     let cy = rect.center().y;
+     let h = rect.height() * 0.45;
+     let w = rect.width();
+ 
+-    // Subtle centre line.
+     painter.line_segment(
+         [egui::pos2(rect.left(), cy), egui::pos2(rect.right(), cy)],
+         egui::Stroke::new(0.5, egui::Color32::from_rgb(55, 45, 75)),
+     );
+ 
+-    // Waveform polyline.
+     let pts: Vec<egui::Pos2> = wave
+         .iter()
+         .enumerate()
+@@ -93,10 +186,7 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+         .collect();
+ 
+     for win in pts.windows(2) {
+-        painter.line_segment(
+-            [win[0], win[1]],
+-            egui::Stroke::new(1.5, egui::Color32::from_rgb(160, 120, 220)),
+-        );
++        painter.line_segment([win[0], win[1]], egui::Stroke::new(1.5, ACCENT));
+     }
+ }
+ 
+@@ -109,9 +199,19 @@ pub fn create(
+     create_egui_editor(
+         editor_state,
+         (),
+-        |_, _| {},
++        |ctx, _| {
++            // Dark theme base — override egui's default light style.
++            let mut style = (*ctx.style()).clone();
++            style.visuals.window_fill = PANEL_BG;
++            style.visuals.panel_fill = PANEL_BG;
++            style.visuals.widgets.noninteractive.bg_fill = SECTION_BG;
++            style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(35, 28, 52);
++            style.visuals.widgets.hovered.bg_fill = ACCENT_DIM;
++            style.visuals.widgets.active.bg_fill = ACCENT;
++            style.visuals.widgets.noninteractive.fg_stroke.color = ACCENT;
++            ctx.set_style(style);
++        },
+         move |ctx, setter, _state| {
+-            // Space = one-shot trigger.
+             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                 trigger.store(true, Ordering::Relaxed);
+             }
+@@ -121,92 +221,112 @@ pub fn create(
+                 ui.add_space(4.0);
+ 
+                 kick_waveform(ui, &params);
+-                ui.add_space(4.0);
++                ui.add_space(6.0);
+ 
++                // ── PITCH ────────────────────────────────────────────────────
+                 section_header(ui, "PITCH");
+                 ui.add_space(4.0);
+-
+                 egui::Grid::new("pitch_params")
+                     .num_columns(2)
+                     .min_col_width(90.0)
+-                    .spacing([12.0, 6.0])
++                    .spacing([12.0, 5.0])
+                     .show(ui, |ui| {
+                         ui.label("Start");
+                         ui.add(widgets::ParamSlider::for_param(&params.pitch_start, setter));
+                         ui.end_row();
+-
+                         ui.label("End");
+                         ui.add(widgets::ParamSlider::for_param(&params.pitch_end, setter));
+                         ui.end_row();
+-
+                         ui.label("Decay");
+                         ui.add(widgets::ParamSlider::for_param(&params.decay, setter));
+                         ui.end_row();
+-
+                         ui.label("Curve");
+                         ui.add(widgets::ParamSlider::for_param(&params.curve, setter));
+                         ui.end_row();
+                     });
+ 
+-                ui.add_space(4.0);
++                ui.add_space(6.0);
++
++                // ── AMPLITUDE ────────────────────────────────────────────────
+                 section_header(ui, "AMPLITUDE");
+                 ui.add_space(4.0);
+-
+                 egui::Grid::new("amp_params")
+                     .num_columns(2)
+                     .min_col_width(90.0)
+-                    .spacing([12.0, 6.0])
++                    .spacing([12.0, 5.0])
+                     .show(ui, |ui| {
+                         ui.label("Decay");
+                         ui.add(widgets::ParamSlider::for_param(&params.amp_decay, setter));
+                         ui.end_row();
+-
+                         ui.label("Curve");
+                         ui.add(widgets::ParamSlider::for_param(&params.amp_curve, setter));
+                         ui.end_row();
+-
+                         ui.label("Level");
+                         ui.add(widgets::ParamSlider::for_param(&params.level, setter));
+                         ui.end_row();
+                     });
+ 
+-                ui.add_space(4.0);
++                ui.add_space(6.0);
++
++                // ── SHAPING ──────────────────────────────────────────────────
+                 section_header(ui, "SHAPING");
+                 ui.add_space(4.0);
+ 
++                // Segmented switch for the shaper model.
++                shaper_switch(ui, params.shaper.value(), setter, &params.shaper);
++                ui.add_space(5.0);
++
+                 egui::Grid::new("shaping_params")
+                     .num_columns(2)
+                     .min_col_width(90.0)
+-                    .spacing([12.0, 6.0])
++                    .spacing([12.0, 5.0])
+                     .show(ui, |ui| {
+-                        ui.label("Shaper");
+-                        ui.add(widgets::ParamSlider::for_param(&params.shaper, setter));
+-                        ui.end_row();
+-
+                         ui.label("Drive");
+                         ui.add(widgets::ParamSlider::for_param(&params.drive, setter));
+                         ui.end_row();
+-
+                         ui.label("Bias");
+                         ui.add(widgets::ParamSlider::for_param(&params.bias, setter));
+                         ui.end_row();
+-
+                         ui.label("Mix");
+                         ui.add(widgets::ParamSlider::for_param(&params.dist_mix, setter));
+                         ui.end_row();
+                     });
+ 
++                ui.add_space(6.0);
++
++                // ── PRE / POST EQ ────────────────────────────────────────────
++                section_header(ui, "EQ");
+                 ui.add_space(4.0);
++                egui::Grid::new("eq_params")
++                    .num_columns(2)
++                    .min_col_width(90.0)
++                    .spacing([12.0, 5.0])
++                    .show(ui, |ui| {
++                        ui.label("Screech Hz");
++                        ui.add(widgets::ParamSlider::for_param(&params.pre_eq_freq, setter));
++                        ui.end_row();
++                        ui.label("Screech Q");
++                        ui.add(widgets::ParamSlider::for_param(&params.pre_eq_q, setter));
++                        ui.end_row();
++                        ui.label("Screech dB");
++                        ui.add(widgets::ParamSlider::for_param(&params.pre_eq_gain, setter));
++                        ui.end_row();
++                        ui.label("Tone");
++                        ui.add(widgets::ParamSlider::for_param(&params.tone, setter));
++                        ui.end_row();
++                    });
++
++                ui.add_space(6.0);
++
++                // ── SEQUENCER ────────────────────────────────────────────────
+                 section_header(ui, "SEQUENCER");
+                 ui.add_space(4.0);
+-
+                 egui::Grid::new("seq_params")
+                     .num_columns(2)
+                     .min_col_width(90.0)
+-                    .spacing([12.0, 6.0])
++                    .spacing([12.0, 5.0])
+                     .show(ui, |ui| {
+                         ui.label("BPM");
+-                        // DragValue: click-to-type or drag left/right for coarse/fine control.
+                         let mut bpm = params.bpm.value();
+                         if ui
+                             .add(
+@@ -224,7 +344,7 @@ pub fn create(
+                         ui.end_row();
+                     });
+ 
+-                ui.add_space(4.0);
++                ui.add_space(6.0);
+                 ui.horizontal(|ui| {
+                     let is_playing = playing.load(Ordering::Relaxed);
+                     let play_label = if is_playing { "⏹  Stop" } else { "▶  Play" };
+diff --git a/src/lib.rs b/src/lib.rs
+index 1015d2f..6d27281 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,7 @@ mod dsp;
+ mod editor;
+ mod params;
+ 
+-use dsp::{shape, DcBlocker, Envelope, SineOsc};
++use dsp::{shape, BiquadFilter, DcBlocker, Envelope, SineOsc};
+ use params::HardKickParams;
+ 
+ // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
+@@ -31,13 +31,15 @@ pub struct HardKick {
+     pending_trigger: bool,
+     pending_velocity: f32,
+     dc_blocker: DcBlocker,
++    pre_eq: BiquadFilter,
++    post_eq: BiquadFilter,
+ }
+ 
+ impl Default for HardKick {
+     fn default() -> Self {
+         Self {
+             params: Arc::new(HardKickParams::default()),
+-            editor_state: EguiState::from_size(340, 600),
++            editor_state: EguiState::from_size(340, 720),
+             trigger: Arc::new(AtomicBool::new(false)),
+             playing: Arc::new(AtomicBool::new(false)),
+             osc: SineOsc::new(44_100.0),
+@@ -51,6 +53,8 @@ impl Default for HardKick {
+             pending_trigger: false,
+             pending_velocity: 1.0,
+             dc_blocker: DcBlocker::default(),
++            pre_eq: BiquadFilter::default(),
++            post_eq: BiquadFilter::default(),
+         }
+     }
+ }
+@@ -128,6 +132,8 @@ impl Plugin for HardKick {
+         self.declick_counter = 0;
+         self.pending_trigger = false;
+         self.dc_blocker.reset();
++        self.pre_eq.reset();
++        self.post_eq.reset();
+     }
+ 
+     fn process(
+@@ -142,6 +148,16 @@ impl Plugin for HardKick {
+         let manual_trigger = self.trigger.swap(false, Ordering::Relaxed);
+         let rising_edge = playing && !self.was_playing;
+ 
++        // Recompute EQ coefficients once per buffer — cheap and avoids per-sample branches.
++        self.pre_eq.set_peaking(
++            self.params.pre_eq_freq.value(),
++            self.params.pre_eq_q.value(),
++            self.params.pre_eq_gain.value(),
++            self.sample_rate,
++        );
++        self.post_eq
++            .set_highshelf(4000.0, self.params.tone.value(), self.sample_rate);
++
+         if !playing {
+             self.beat_phase = 0.0;
+         }
+@@ -192,17 +208,21 @@ impl Plugin for HardKick {
+                     pitch_t.powf(self.params.curve.value()),
+                 );
+ 
+-                // Waveshape the full-scale oscillator so the harmonic content stays
+-                // consistent across the kick, then apply the amplitude envelope.
++                // Signal path: osc → pre-EQ → shaper → DC block → post-EQ
++                // Pre-EQ boosts a narrow band before the saturator; the non-linearity
++                // then reacts asymmetrically to that band, generating the "screech".
+                 let osc = self.osc.tick(freq);
++                let pre = self.pre_eq.process(osc);
+                 let shaped = shape(
+-                    osc,
++                    pre,
+                     self.params.shaper.value(),
+                     self.params.drive.value(),
+                     self.params.bias.value(),
+                 );
+                 let mix = self.params.dist_mix.value();
+-                let body = self.dc_blocker.process(lerp(osc, shaped, mix));
++                let body = self
++                    .post_eq
++                    .process(self.dc_blocker.process(lerp(pre, shaped, mix)));
+ 
+                 let amp_t = self
+                     .amp_env
+diff --git a/src/params.rs b/src/params.rs
+index 3bc068f..ea50673 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -47,6 +47,30 @@ pub struct HardKickParams {
+     #[id = "dist_mix"]
+     pub dist_mix: FloatParam,
+ 
++    /// Pre-distortion peaking EQ frequency in Hz.
++    ///
++    /// A narrow boost here fed into the saturator produces the rawstyle "screech":
++    /// the non-linearity amplifies only that band, generating overtones around it.
++    #[id = "pre_eq_freq"]
++    pub pre_eq_freq: FloatParam,
++
++    /// Pre-distortion peaking EQ resonance (Q).
++    ///
++    /// Higher values narrow the peak. Typical rawstyle settings: 3–8.
++    #[id = "pre_eq_q"]
++    pub pre_eq_q: FloatParam,
++
++    /// Pre-distortion peaking EQ gain in dB (0 = bypassed).
++    #[id = "pre_eq_gain"]
++    pub pre_eq_gain: FloatParam,
++
++    /// Post-distortion high-shelf tone control in dB.
++    ///
++    /// Negative values tame harshness after the waveshaper; positive values
++    /// add brightness. Shelf frequency is fixed at 4 kHz.
++    #[id = "tone"]
++    pub tone: FloatParam,
++
+     /// Internal sequencer tempo in BPM.
+     #[id = "bpm"]
+     pub bpm: FloatParam,
+@@ -125,6 +149,53 @@ impl Default for HardKickParams {
+             dist_mix: FloatParam::new("Dist mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
++            pre_eq_freq: FloatParam::new(
++                "Pre EQ freq",
++                2000.0,
++                FloatRange::Skewed {
++                    min: 200.0,
++                    max: 8000.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" Hz")
++            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
++
++            pre_eq_q: FloatParam::new(
++                "Pre EQ Q",
++                3.0,
++                FloatRange::Skewed {
++                    min: 0.5,
++                    max: 10.0,
++                    factor: FloatRange::skew_factor(1.0),
++                },
++            )
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
++            // Default 0 dB = pre-EQ is inactive until the user raises it.
++            pre_eq_gain: FloatParam::new(
++                "Pre EQ gain",
++                0.0,
++                FloatRange::Linear {
++                    min: 0.0,
++                    max: 24.0,
++                },
++            )
++            .with_unit(" dB")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
++            // Default 0 dB = tone control is neutral.
++            tone: FloatParam::new(
++                "Tone",
++                0.0,
++                FloatRange::Linear {
++                    min: -18.0,
++                    max: 6.0,
++                },
++            )
++            .with_unit(" dB")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
+             bpm: FloatParam::new(
+                 "BPM",
+                 150.0,
+-- 
+2.43.0
+
