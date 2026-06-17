@@ -16,6 +16,7 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug", features = [
     "standalone",
 ] }
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug" }
+hound = "3.5"
 
 [profile.release]
 opt-level = 3

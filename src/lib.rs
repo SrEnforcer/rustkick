@@ -8,6 +8,8 @@ use std::sync::{
 mod dsp;
 mod editor;
 mod params;
+mod presets;
+mod render;
 
 use dsp::{
     shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
@@ -47,7 +49,7 @@ impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(340, 920),
+            editor_state: EguiState::from_size(340, 1050),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),

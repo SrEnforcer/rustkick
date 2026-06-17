@@ -1,5 +1,7 @@
 use crate::dsp::{shape, Shaper};
 use crate::params::HardKickParams;
+use crate::presets;
+use crate::render::export_wav;
 use nih_plug::context::gui::ParamSetter;
 use nih_plug::prelude::Editor;
 use nih_plug_egui::egui::epaint::StrokeKind;
@@ -223,7 +225,35 @@ pub fn create(
                 ui.add_space(4.0);
 
                 kick_waveform(ui, &params);
-                ui.add_space(6.0);
+                ui.add_space(4.0);
+
+                // ── PRESETS ──────────────────────────────────────────────────
+                section_header(ui, "PRESETS");
+                ui.add_space(4.0);
+                // Two rows of three preset buttons.
+                for row in presets::PRESETS.chunks(3) {
+                    ui.horizontal(|ui| {
+                        for preset in row {
+                            let btn = egui::Button::new(
+                                egui::RichText::new(preset.name)
+                                    .font(egui::FontId::monospace(9.5))
+                                    .color(ACCENT),
+                            )
+                            .fill(SECTION_BG)
+                            .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
+                            .min_size(egui::vec2(
+                                (ui.available_width() - 8.0) / row.len() as f32,
+                                22.0,
+                            ));
+                            if ui.add(btn).clicked() {
+                                presets::apply(preset, &params, setter);
+                            }
+                        }
+                    });
+                    ui.add_space(3.0);
+                }
+
+                ui.add_space(4.0);
 
                 // ── PITCH ────────────────────────────────────────────────────
                 section_header(ui, "PITCH");
@@ -406,6 +436,16 @@ pub fn create(
                     }
                     if ui.button("⚡  Trigger").clicked() {
                         trigger.store(true, Ordering::Relaxed);
+                    }
+                    if ui.button("💾  Export WAV").clicked() {
+                        let path = format!(
+                            "{}/hardkick-export.wav",
+                            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+                        );
+                        match export_wav(&params, &path) {
+                            Ok(()) => nih_plug::nih_log!("Exported to {}", path),
+                            Err(e) => nih_plug::nih_log!("Export failed: {}", e),
+                        }
                     }
                 });
             });
