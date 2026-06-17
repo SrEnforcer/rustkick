@@ -137,9 +137,11 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
     for i in 0..N {
         let t_amp = i as f32 / (N - 1) as f32;
         let t_pitch = (i as f32 * step / pitch_samples).min(1.0);
-        let freq = params.pitch_start.value()
-            + (params.pitch_end.value() - params.pitch_start.value())
-                * t_pitch.powf(params.curve.value());
+        // Exponential pitch sweep, matching the audio path.
+        let shaped_t = t_pitch.powf(params.curve.value());
+        let start = params.pitch_start.value();
+        let end = params.pitch_end.value();
+        let freq = start * (end / start).powf(shaped_t);
         let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value();
 
         let osc = (phase * TAU).sin();
@@ -313,6 +315,27 @@ pub fn create(
                         ui.end_row();
                         ui.label("Tone");
                         ui.add(widgets::ParamSlider::for_param(&params.tone, setter));
+                        ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+
+                // ── TRANSIENT ────────────────────────────────────────────────
+                section_header(ui, "TRANSIENT");
+                ui.add_space(4.0);
+                egui::Grid::new("transient_params")
+                    .num_columns(2)
+                    .min_col_width(90.0)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label("Click");
+                        ui.add(widgets::ParamSlider::for_param(&params.click_level, setter));
+                        ui.end_row();
+                        ui.label("Click decay");
+                        ui.add(widgets::ParamSlider::for_param(&params.click_decay, setter));
+                        ui.end_row();
+                        ui.label("Click tone");
+                        ui.add(widgets::ParamSlider::for_param(&params.click_tone, setter));
                         ui.end_row();
                     });
 

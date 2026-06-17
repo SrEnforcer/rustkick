@@ -89,6 +89,29 @@ impl BiquadFilter {
         self.a2 = a2 / a0;
     }
 
+    /// High-pass filter (RBJ cookbook) at `freq` with resonance `q`.
+    ///
+    /// Used to shape the transient click so only its high-frequency "tok"
+    /// character remains and it doesn't muddy the sub.
+    pub fn set_highpass(&mut self, freq: f32, q: f32, sample_rate: f32) {
+        let w0 = TAU * freq / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q);
+
+        let b0 = (1.0 + cos_w0) / 2.0;
+        let b1 = -(1.0 + cos_w0);
+        let b2 = (1.0 + cos_w0) / 2.0;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        self.b0 = b0 / a0;
+        self.b1 = b1 / a0;
+        self.b2 = b2 / a0;
+        self.a1 = a1 / a0;
+        self.a2 = a2 / a0;
+    }
+
     /// Processes a single sample through the biquad.
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {

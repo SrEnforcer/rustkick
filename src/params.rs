@@ -71,6 +71,18 @@ pub struct HardKickParams {
     #[id = "tone"]
     pub tone: FloatParam,
 
+    /// Transient click ("tok") level, mixed in parallel after the distortion.
+    #[id = "click_level"]
+    pub click_level: FloatParam,
+
+    /// Transient click decay time in milliseconds — very short for a mechanical attack.
+    #[id = "click_decay"]
+    pub click_decay: FloatParam,
+
+    /// High-pass cutoff that shapes the click; higher = thinner, more "tok".
+    #[id = "click_tone"]
+    pub click_tone: FloatParam,
+
     /// Internal sequencer tempo in BPM.
     #[id = "bpm"]
     pub bpm: FloatParam,
@@ -195,6 +207,38 @@ impl Default for HardKickParams {
             )
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            // Default 0.0 = no click until the user dials it in.
+            click_level: FloatParam::new(
+                "Click level",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            click_decay: FloatParam::new(
+                "Click decay",
+                4.0,
+                FloatRange::Skewed {
+                    min: 0.5,
+                    max: 50.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            click_tone: FloatParam::new(
+                "Click tone",
+                2000.0,
+                FloatRange::Skewed {
+                    min: 200.0,
+                    max: 8000.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
 
             bpm: FloatParam::new(
                 "BPM",

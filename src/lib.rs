@@ -9,7 +9,7 @@ mod dsp;
 mod editor;
 mod params;
 
-use dsp::{shape, BiquadFilter, DcBlocker, Envelope, SineOsc};
+use dsp::{shape, BiquadFilter, DcBlocker, Envelope, Noise, SineOsc};
 use params::HardKickParams;
 
 // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
@@ -33,13 +33,16 @@ pub struct HardKick {
     dc_blocker: DcBlocker,
     pre_eq: BiquadFilter,
     post_eq: BiquadFilter,
+    noise: Noise,
+    click_env: Envelope,
+    click_hp: BiquadFilter,
 }
 
 impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(340, 720),
+            editor_state: EguiState::from_size(340, 830),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
@@ -55,6 +58,9 @@ impl Default for HardKick {
             dc_blocker: DcBlocker::default(),
             pre_eq: BiquadFilter::default(),
             post_eq: BiquadFilter::default(),
+            noise: Noise::default(),
+            click_env: Envelope::default(),
+            click_hp: BiquadFilter::default(),
         }
     }
 }
@@ -74,11 +80,17 @@ impl HardKick {
             self.pending_trigger = true;
             self.pending_velocity = velocity;
         } else {
-            self.velocity = velocity;
-            self.osc.reset();
-            self.pitch_env.trigger();
-            self.amp_env.trigger();
+            self.fire(velocity);
         }
+    }
+
+    /// Resets the oscillator and (re)triggers all envelopes for a new kick.
+    fn fire(&mut self, velocity: f32) {
+        self.velocity = velocity;
+        self.osc.reset();
+        self.pitch_env.trigger();
+        self.amp_env.trigger();
+        self.click_env.trigger();
     }
 }
 
@@ -134,6 +146,8 @@ impl Plugin for HardKick {
         self.dc_blocker.reset();
         self.pre_eq.reset();
         self.post_eq.reset();
+        self.click_env = Envelope::default();
+        self.click_hp.reset();
     }
 
     fn process(
@@ -157,6 +171,8 @@ impl Plugin for HardKick {
         );
         self.post_eq
             .set_highshelf(4000.0, self.params.tone.value(), self.sample_rate);
+        self.click_hp
+            .set_highpass(self.params.click_tone.value(), 0.707, self.sample_rate);
 
         if !playing {
             self.beat_phase = 0.0;
@@ -197,16 +213,18 @@ impl Plugin for HardKick {
                 next_event = context.next_event();
             }
 
-            // Synthesize.
-            let raw = if self.amp_env.is_active() {
+            // Tonal body.
+            let tonal = if self.amp_env.is_active() {
                 let pitch_t = self
                     .pitch_env
                     .tick(self.params.decay.value() * self.sample_rate);
-                let freq = lerp(
-                    self.params.pitch_start.value(),
-                    self.params.pitch_end.value(),
-                    pitch_t.powf(self.params.curve.value()),
-                );
+                // Exponential (log-domain) pitch sweep: interpolating geometrically
+                // rather than linearly in Hz gives a natural, non-floaty glide that
+                // matches how pitch is perceived (octaves are ratios, not offsets).
+                let shaped_t = pitch_t.powf(self.params.curve.value());
+                let start = self.params.pitch_start.value();
+                let end = self.params.pitch_end.value();
+                let freq = start * (end / start).powf(shaped_t);
 
                 // Signal path: osc → pre-EQ → shaper → DC block → post-EQ
                 // Pre-EQ boosts a narrow band before the saturator; the non-linearity
@@ -231,12 +249,29 @@ impl Plugin for HardKick {
                     * self.velocity
                     * self.params.level.value();
 
-                // Final safety clip; the shapers are already bounded, so this only
-                // catches extreme parameter combinations. A proper limiter comes later.
-                (body * amp).clamp(-1.0, 1.0)
+                body * amp
             } else {
                 0.0
             };
+
+            // Transient "tok" click — a short filtered noise burst mixed in parallel
+            // *after* the distortion (mixdown-after), so it keeps its mechanical
+            // definition instead of being smeared by the saturator.
+            let click = if self.click_env.is_active() {
+                let click_samples = self.params.click_decay.value() * 0.001 * self.sample_rate;
+                let ct = self.click_env.tick(click_samples);
+                let n = self.click_hp.process(self.noise.next_sample());
+                n * (1.0 - ct)
+                    * self.velocity
+                    * self.params.click_level.value()
+                    * self.params.level.value()
+            } else {
+                0.0
+            };
+
+            // Final safety clip; the shapers are already bounded, so this only
+            // catches extreme parameter combinations. A proper limiter comes later.
+            let raw = (tonal + click).clamp(-1.0, 1.0);
 
             // Declick: linearly fade to zero before firing a pending retrigger.
             let value = if self.declick_counter > 0 {
@@ -244,10 +279,7 @@ impl Plugin for HardKick {
                 self.declick_counter -= 1;
                 if self.declick_counter == 0 && self.pending_trigger {
                     self.pending_trigger = false;
-                    self.velocity = self.pending_velocity;
-                    self.osc.reset();
-                    self.pitch_env.trigger();
-                    self.amp_env.trigger();
+                    self.fire(self.pending_velocity);
                 }
                 raw * gain
             } else {
