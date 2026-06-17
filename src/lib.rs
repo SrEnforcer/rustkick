@@ -9,7 +9,9 @@ mod dsp;
 mod editor;
 mod params;
 
-use dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, SineOsc};
+use dsp::{
+    shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
+};
 use params::HardKickParams;
 
 // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
@@ -38,6 +40,7 @@ pub struct HardKick {
     click_hp: BiquadFilter,
     crossover: LRCrossover,
     limiter: Limiter,
+    oversampler: Oversampler,
 }
 
 impl Default for HardKick {
@@ -65,6 +68,7 @@ impl Default for HardKick {
             click_hp: BiquadFilter::default(),
             crossover: LRCrossover::default(),
             limiter: Limiter::default(),
+            oversampler: Oversampler::default(),
         }
     }
 }
@@ -154,6 +158,7 @@ impl Plugin for HardKick {
         self.click_hp.reset();
         self.crossover.reset();
         self.limiter.reset();
+        self.oversampler.reset();
     }
 
     fn process(
@@ -245,12 +250,16 @@ impl Plugin for HardKick {
                 let osc = self.osc.tick(freq);
                 let (sub, high) = self.crossover.process(osc);
                 let pre = self.pre_eq.process(high);
-                let shaped = shape(
-                    pre,
-                    self.params.shaper.value(),
-                    self.params.drive.value(),
-                    self.params.bias.value(),
-                );
+                // Oversample only the nonlinearity — it is the sole source of
+                // aliasing in the chain. Pre/post EQ are linear and stay at base rate.
+                let shaper = self.params.shaper.value();
+                let drive = self.params.drive.value();
+                let bias = self.params.bias.value();
+                let shaped = self
+                    .oversampler
+                    .process(pre, self.params.oversample.value(), |s| {
+                        shape(s, shaper, drive, bias)
+                    });
                 let mix = self.params.dist_mix.value();
                 let driven = self
                     .post_eq

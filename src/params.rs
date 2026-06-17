@@ -1,4 +1,4 @@
-use crate::dsp::Shaper;
+use crate::dsp::{OsFactor, Shaper};
 use nih_plug::prelude::*;
 
 #[derive(Params)]
@@ -88,6 +88,11 @@ pub struct HardKickParams {
     /// Keeps the sub-bass tight and undistorted while the upper body gets driven.
     #[id = "crossover_freq"]
     pub crossover_freq: FloatParam,
+
+    /// Oversampling factor for the waveshaper — suppresses aliasing by running
+    /// the nonlinearity at 2× or 4× the base sample rate.
+    #[id = "oversample"]
+    pub oversample: EnumParam<OsFactor>,
 
     /// Output limiter ceiling in dBFS. The limiter prevents the output from
     /// exceeding this level regardless of drive or level settings.
@@ -255,6 +260,10 @@ impl Default for HardKickParams {
             )
             .with_unit(" Hz")
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+
+            // Default 2× — a clear quality improvement over no oversampling
+            // without the CPU cost of 4×.
+            oversample: EnumParam::new("Oversample", OsFactor::X2),
 
             limiter_threshold: FloatParam::new(
                 "Limiter ceiling",

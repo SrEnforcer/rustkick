@@ -352,6 +352,9 @@ pub fn create(
                     .min_col_width(90.0)
                     .spacing([12.0, 5.0])
                     .show(ui, |ui| {
+                        ui.label("Oversample");
+                        ui.add(widgets::ParamSlider::for_param(&params.oversample, setter));
+                        ui.end_row();
                         ui.label("Ceiling");
                         ui.add(widgets::ParamSlider::for_param(
                             &params.limiter_threshold,
