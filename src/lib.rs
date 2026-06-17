@@ -9,7 +9,7 @@ mod dsp;
 mod editor;
 mod params;
 
-use dsp::{shape, DcBlocker, Envelope, SineOsc};
+use dsp::{shape, BiquadFilter, DcBlocker, Envelope, SineOsc};
 use params::HardKickParams;
 
 // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
@@ -31,13 +31,15 @@ pub struct HardKick {
     pending_trigger: bool,
     pending_velocity: f32,
     dc_blocker: DcBlocker,
+    pre_eq: BiquadFilter,
+    post_eq: BiquadFilter,
 }
 
 impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(340, 600),
+            editor_state: EguiState::from_size(340, 720),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
@@ -51,6 +53,8 @@ impl Default for HardKick {
             pending_trigger: false,
             pending_velocity: 1.0,
             dc_blocker: DcBlocker::default(),
+            pre_eq: BiquadFilter::default(),
+            post_eq: BiquadFilter::default(),
         }
     }
 }
@@ -128,6 +132,8 @@ impl Plugin for HardKick {
         self.declick_counter = 0;
         self.pending_trigger = false;
         self.dc_blocker.reset();
+        self.pre_eq.reset();
+        self.post_eq.reset();
     }
 
     fn process(
@@ -141,6 +147,16 @@ impl Plugin for HardKick {
 
         let manual_trigger = self.trigger.swap(false, Ordering::Relaxed);
         let rising_edge = playing && !self.was_playing;
+
+        // Recompute EQ coefficients once per buffer — cheap and avoids per-sample branches.
+        self.pre_eq.set_peaking(
+            self.params.pre_eq_freq.value(),
+            self.params.pre_eq_q.value(),
+            self.params.pre_eq_gain.value(),
+            self.sample_rate,
+        );
+        self.post_eq
+            .set_highshelf(4000.0, self.params.tone.value(), self.sample_rate);
 
         if !playing {
             self.beat_phase = 0.0;
@@ -192,17 +208,21 @@ impl Plugin for HardKick {
                     pitch_t.powf(self.params.curve.value()),
                 );
 
-                // Waveshape the full-scale oscillator so the harmonic content stays
-                // consistent across the kick, then apply the amplitude envelope.
+                // Signal path: osc → pre-EQ → shaper → DC block → post-EQ
+                // Pre-EQ boosts a narrow band before the saturator; the non-linearity
+                // then reacts asymmetrically to that band, generating the "screech".
                 let osc = self.osc.tick(freq);
+                let pre = self.pre_eq.process(osc);
                 let shaped = shape(
-                    osc,
+                    pre,
                     self.params.shaper.value(),
                     self.params.drive.value(),
                     self.params.bias.value(),
                 );
                 let mix = self.params.dist_mix.value();
-                let body = self.dc_blocker.process(lerp(osc, shaped, mix));
+                let body = self
+                    .post_eq
+                    .process(self.dc_blocker.process(lerp(pre, shaped, mix)));
 
                 let amp_t = self
                     .amp_env

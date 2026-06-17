@@ -47,6 +47,30 @@ pub struct HardKickParams {
     #[id = "dist_mix"]
     pub dist_mix: FloatParam,
 
+    /// Pre-distortion peaking EQ frequency in Hz.
+    ///
+    /// A narrow boost here fed into the saturator produces the rawstyle "screech":
+    /// the non-linearity amplifies only that band, generating overtones around it.
+    #[id = "pre_eq_freq"]
+    pub pre_eq_freq: FloatParam,
+
+    /// Pre-distortion peaking EQ resonance (Q).
+    ///
+    /// Higher values narrow the peak. Typical rawstyle settings: 3–8.
+    #[id = "pre_eq_q"]
+    pub pre_eq_q: FloatParam,
+
+    /// Pre-distortion peaking EQ gain in dB (0 = bypassed).
+    #[id = "pre_eq_gain"]
+    pub pre_eq_gain: FloatParam,
+
+    /// Post-distortion high-shelf tone control in dB.
+    ///
+    /// Negative values tame harshness after the waveshaper; positive values
+    /// add brightness. Shelf frequency is fixed at 4 kHz.
+    #[id = "tone"]
+    pub tone: FloatParam,
+
     /// Internal sequencer tempo in BPM.
     #[id = "bpm"]
     pub bpm: FloatParam,
@@ -124,6 +148,53 @@ impl Default for HardKickParams {
 
             dist_mix: FloatParam::new("Dist mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            pre_eq_freq: FloatParam::new(
+                "Pre EQ freq",
+                2000.0,
+                FloatRange::Skewed {
+                    min: 200.0,
+                    max: 8000.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+
+            pre_eq_q: FloatParam::new(
+                "Pre EQ Q",
+                3.0,
+                FloatRange::Skewed {
+                    min: 0.5,
+                    max: 10.0,
+                    factor: FloatRange::skew_factor(1.0),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            // Default 0 dB = pre-EQ is inactive until the user raises it.
+            pre_eq_gain: FloatParam::new(
+                "Pre EQ gain",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 24.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            // Default 0 dB = tone control is neutral.
+            tone: FloatParam::new(
+                "Tone",
+                0.0,
+                FloatRange::Linear {
+                    min: -18.0,
+                    max: 6.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
             bpm: FloatParam::new(
                 "BPM",
