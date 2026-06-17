@@ -1,0 +1,5 @@
+[alias]
+dev = "run --bin hardkick-standalone --release"
+
+[env]
+PULSE_SERVER = "unix:/mnt/wslg/PulseServer"

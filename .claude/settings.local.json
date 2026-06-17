@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo new *)",
+      "Bash(mkdir -p /home/user1/projects/music/rustkick/hardkick/src/dsp)"
+    ],
+    "additionalDirectories": [
+      "/home/user1/projects/music/rustkick/hardkick/src"
+    ]
+  }
+}

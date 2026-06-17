@@ -12,6 +12,9 @@ mod params;
 use dsp::{Envelope, SineOsc};
 use params::HardKickParams;
 
+// ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
+const DECLICK_LEN: i32 = 64;
+
 pub struct HardKick {
     params: Arc<HardKickParams>,
     editor_state: Arc<EguiState>,
@@ -24,13 +27,16 @@ pub struct HardKick {
     beat_phase: f32,
     was_playing: bool,
     sample_rate: f32,
+    declick_counter: i32,
+    pending_trigger: bool,
+    pending_velocity: f32,
 }
 
 impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(340, 380),
+            editor_state: EguiState::from_size(340, 470),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
@@ -40,12 +46,34 @@ impl Default for HardKick {
             beat_phase: 0.0,
             was_playing: false,
             sample_rate: 44_100.0,
+            declick_counter: 0,
+            pending_trigger: false,
+            pending_velocity: 1.0,
         }
     }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+impl HardKick {
+    /// Fires a trigger, or — if the envelope is still active — starts a short linear fade-out
+    /// first to prevent the click caused by an abrupt amplitude discontinuity on retrigger.
+    fn schedule_trigger(&mut self, velocity: f32) {
+        if self.amp_env.is_active() {
+            if self.declick_counter == 0 {
+                self.declick_counter = DECLICK_LEN;
+            }
+            self.pending_trigger = true;
+            self.pending_velocity = velocity;
+        } else {
+            self.velocity = velocity;
+            self.osc.reset();
+            self.pitch_env.trigger();
+            self.amp_env.trigger();
+        }
+    }
 }
 
 impl Plugin for HardKick {
@@ -95,6 +123,8 @@ impl Plugin for HardKick {
         self.osc.reset();
         self.pitch_env = Envelope::default();
         self.amp_env = Envelope::default();
+        self.declick_counter = 0;
+        self.pending_trigger = false;
     }
 
     fn process(
@@ -103,24 +133,12 @@ impl Plugin for HardKick {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        if self.trigger.swap(false, Ordering::Relaxed) {
-            self.velocity = 1.0;
-            self.osc.reset();
-            self.pitch_env.trigger();
-            self.amp_env.trigger();
-        }
-
         let playing = self.playing.load(Ordering::Relaxed);
         let beat_samples = 60.0 / self.params.bpm.value() * self.sample_rate;
 
-        // Rising edge: fire immediately when play starts.
-        if playing && !self.was_playing {
-            self.velocity = 1.0;
-            self.osc.reset();
-            self.pitch_env.trigger();
-            self.amp_env.trigger();
-            self.beat_phase = 0.0;
-        }
+        let manual_trigger = self.trigger.swap(false, Ordering::Relaxed);
+        let rising_edge = playing && !self.was_playing;
+
         if !playing {
             self.beat_phase = 0.0;
         }
@@ -129,49 +147,68 @@ impl Plugin for HardKick {
         let mut next_event = context.next_event();
 
         for (sample_id, channel_samples) in buffer.iter_samples().enumerate() {
+            // Block-level triggers are applied at the first sample of each buffer.
+            if sample_id == 0 {
+                if manual_trigger {
+                    self.schedule_trigger(1.0);
+                }
+                if rising_edge {
+                    self.schedule_trigger(1.0);
+                    self.beat_phase = 0.0;
+                }
+            }
+
             // Sequencer beat clock.
             if playing {
                 self.beat_phase += 1.0;
                 if self.beat_phase >= beat_samples {
                     self.beat_phase -= beat_samples;
-                    self.velocity = 1.0;
-                    self.osc.reset();
-                    self.pitch_env.trigger();
-                    self.amp_env.trigger();
+                    self.schedule_trigger(1.0);
                 }
             }
 
+            // MIDI events.
             while let Some(event) = next_event {
                 if event.timing() != sample_id as u32 {
                     break;
                 }
-
                 if let NoteEvent::NoteOn { velocity, .. } = event {
-                    self.velocity = velocity;
-                    self.osc.reset();
-                    self.pitch_env.trigger();
-                    self.amp_env.trigger();
+                    self.schedule_trigger(velocity);
                 }
-
                 next_event = context.next_event();
             }
 
-            let value = if self.amp_env.is_active() {
+            // Synthesize.
+            let raw = if self.amp_env.is_active() {
                 let pitch_t = self.pitch_env.tick(self.params.decay.value() * self.sample_rate);
                 let freq = lerp(
                     self.params.pitch_start.value(),
                     self.params.pitch_end.value(),
                     pitch_t.powf(self.params.curve.value()),
                 );
-
                 let amp_t = self.amp_env.tick(self.params.amp_decay.value() * self.sample_rate);
                 let amp = (1.0 - amp_t).powf(self.params.amp_curve.value())
                     * self.velocity
                     * self.params.level.value();
-
                 self.osc.tick(freq) * amp
             } else {
                 0.0
+            };
+
+            // Declick: linearly fade to zero before firing a pending retrigger.
+            let value = if self.declick_counter > 0 {
+                let gain = self.declick_counter as f32 / DECLICK_LEN as f32;
+                self.declick_counter -= 1;
+                if self.declick_counter == 0 && self.pending_trigger {
+                    self.pending_trigger = false;
+                    self.velocity = self.pending_velocity;
+                    self.osc.reset();
+                    self.pitch_env.trigger();
+                    self.amp_env.trigger();
+                }
+                raw * gain
+            } else {
+                raw
             };
 
             for sample in channel_samples {
