@@ -1,0 +1,341 @@
+From c244021f145c298911d9f9f57757680ed58afcf9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 17 Jun 2026 21:35:17 +0000
+Subject: [PATCH] Add 2x/4x oversampling around the waveshaper (milestone 7)
+
+The waveshaper generates harmonics above Nyquist that fold back as inharmonic
+aliasing, most audible on FOLD and high drive. This wraps only the nonlinearity
+(the sole aliasing source) in a polyphase FIR oversampler:
+
+- Windowed-sinc (Blackman) 32-tap prototype, split into two 16-tap polyphase
+  components for interpolation and decimation.
+- A single 2x stage; two cascade for 4x. All state stack-allocated, no heap.
+- New EnumParam (Off/2x/4x, default 2x) and an Oversample control in OUTPUT.
+
+Pre/post EQ stay at base rate since they are linear and do not alias.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/dsp/mod.rs        |   2 +
+ src/dsp/oversample.rs | 180 ++++++++++++++++++++++++++++++++++++++++++
+ src/editor.rs         |   3 +
+ src/lib.rs            |  23 ++++--
+ src/params.rs         |  11 ++-
+ 5 files changed, 211 insertions(+), 8 deletions(-)
+ create mode 100644 src/dsp/oversample.rs
+
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index fc02ba5..5445d8a 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -4,6 +4,7 @@ pub mod filter;
+ pub mod limiter;
+ pub mod noise;
+ pub mod osc;
++pub mod oversample;
+ 
+ pub use distortion::{shape, DcBlocker, Shaper};
+ pub use envelope::Envelope;
+@@ -11,3 +12,4 @@ pub use filter::{BiquadFilter, LRCrossover};
+ pub use limiter::Limiter;
+ pub use noise::Noise;
+ pub use osc::SineOsc;
++pub use oversample::{OsFactor, Oversampler};
+diff --git a/src/dsp/oversample.rs b/src/dsp/oversample.rs
+new file mode 100644
+index 0000000..002d4f5
+--- /dev/null
++++ b/src/dsp/oversample.rs
+@@ -0,0 +1,180 @@
++use nih_plug::prelude::Enum;
++use std::f32::consts::{PI, TAU};
++
++/// Oversampling factor for the waveshaper stage.
++#[derive(Enum, PartialEq, Eq, Clone, Copy)]
++pub enum OsFactor {
++    #[id = "off"]
++    #[name = "Off"]
++    Off,
++    #[id = "x2"]
++    #[name = "2x"]
++    X2,
++    #[id = "x4"]
++    #[name = "4x"]
++    X4,
++}
++
++// Prototype lowpass: 32 taps, split into two 16-tap polyphase components.
++const PHASE_LEN: usize = 16;
++const N_TAPS: usize = PHASE_LEN * 2;
++
++/// A single 2× oversampling stage: a polyphase FIR interpolator (1×→2×) and a
++/// matching polyphase FIR decimator (2×→1×). Two stages cascade for 4×.
++///
++/// All state is fixed-size and stack-allocated — no heap in the audio path.
++struct Stage2x {
++    up_hist: [f32; PHASE_LEN],
++    dn_even: [f32; PHASE_LEN],
++    dn_odd: [f32; PHASE_LEN],
++}
++
++impl Stage2x {
++    fn new() -> Self {
++        Self {
++            up_hist: [0.0; PHASE_LEN],
++            dn_even: [0.0; PHASE_LEN],
++            dn_odd: [0.0; PHASE_LEN],
++        }
++    }
++
++    fn reset(&mut self) {
++        self.up_hist = [0.0; PHASE_LEN];
++        self.dn_even = [0.0; PHASE_LEN];
++        self.dn_odd = [0.0; PHASE_LEN];
++    }
++
++    /// Interpolate one input sample into two output samples at twice the rate.
++    #[inline]
++    fn upsample(&mut self, x: f32, p0: &[f32; PHASE_LEN], p1: &[f32; PHASE_LEN]) -> (f32, f32) {
++        self.up_hist.copy_within(0..PHASE_LEN - 1, 1);
++        self.up_hist[0] = x;
++
++        let mut o0 = 0.0;
++        let mut o1 = 0.0;
++        for k in 0..PHASE_LEN {
++            o0 += p0[k] * self.up_hist[k];
++            o1 += p1[k] * self.up_hist[k];
++        }
++        (o0, o1)
++    }
++
++    /// Decimate the two oversampled samples back into one at the base rate.
++    #[inline]
++    fn downsample(&mut self, y0: f32, y1: f32, p0: &[f32; PHASE_LEN], p1: &[f32; PHASE_LEN]) -> f32 {
++        self.dn_even.copy_within(0..PHASE_LEN - 1, 1);
++        self.dn_even[0] = y0;
++        self.dn_odd.copy_within(0..PHASE_LEN - 1, 1);
++        self.dn_odd[0] = y1;
++
++        let mut o = 0.0;
++        for k in 0..PHASE_LEN {
++            o += p0[k] * self.dn_even[k] + p1[k] * self.dn_odd[k];
++        }
++        o
++    }
++}
++
++/// Anti-aliasing oversampler that runs a nonlinearity at 2× or 4× the base
++/// sample rate. The waveshaper generates harmonics above Nyquist that fold back
++/// as inharmonic aliasing; processing at a higher rate pushes those products up
++/// so the decimation lowpass can remove them before they fold.
++pub struct Oversampler {
++    // Polyphase coefficients for interpolation (gain ×2) and decimation (gain ×1).
++    up_phase0: [f32; PHASE_LEN],
++    up_phase1: [f32; PHASE_LEN],
++    dn_phase0: [f32; PHASE_LEN],
++    dn_phase1: [f32; PHASE_LEN],
++    stage_a: Stage2x,
++    stage_b: Stage2x,
++}
++
++impl Default for Oversampler {
++    fn default() -> Self {
++        // Design a windowed-sinc lowpass with cutoff at the base-rate Nyquist
++        // (0.25 of the 2× rate), Blackman-windowed for strong stopband rejection.
++        let mut proto = [0.0_f32; N_TAPS];
++        let m = (N_TAPS - 1) as f32;
++        let fc = 0.25;
++        let mut sum = 0.0;
++        for (i, tap) in proto.iter_mut().enumerate() {
++            let n = i as f32 - m / 2.0;
++            let sinc = if n.abs() < 1e-6 {
++                2.0 * fc
++            } else {
++                (TAU * fc * n).sin() / (PI * n)
++            };
++            let phase = i as f32 / m;
++            let window =
++                0.42 - 0.5 * (TAU * phase).cos() + 0.08 * (2.0 * TAU * phase).cos();
++            *tap = sinc * window;
++            sum += *tap;
++        }
++        // Normalise so the passband (DC) gain is exactly unity.
++        for tap in proto.iter_mut() {
++            *tap /= sum;
++        }
++
++        let mut up_phase0 = [0.0; PHASE_LEN];
++        let mut up_phase1 = [0.0; PHASE_LEN];
++        let mut dn_phase0 = [0.0; PHASE_LEN];
++        let mut dn_phase1 = [0.0; PHASE_LEN];
++        for m in 0..PHASE_LEN {
++            // ×2 on the interpolator compensates for the zero-stuffing energy loss.
++            up_phase0[m] = proto[2 * m] * 2.0;
++            up_phase1[m] = proto[2 * m + 1] * 2.0;
++            dn_phase0[m] = proto[2 * m];
++            dn_phase1[m] = proto[2 * m + 1];
++        }
++
++        Self {
++            up_phase0,
++            up_phase1,
++            dn_phase0,
++            dn_phase1,
++            stage_a: Stage2x::new(),
++            stage_b: Stage2x::new(),
++        }
++    }
++}
++
++impl Oversampler {
++    pub fn reset(&mut self) {
++        self.stage_a.reset();
++        self.stage_b.reset();
++    }
++
++    /// Run `f` (the nonlinearity) at the selected oversampling factor.
++    ///
++    /// At `Off` the function is applied directly. At 2× / 4× the input is
++    /// upsampled, `f` is evaluated at every subsample, and the result is
++    /// decimated back to the base rate.
++    #[inline]
++    pub fn process<F: FnMut(f32) -> f32>(&mut self, x: f32, factor: OsFactor, mut f: F) -> f32 {
++        let (up0, up1) = (&self.up_phase0, &self.up_phase1);
++        let (dn0, dn1) = (&self.dn_phase0, &self.dn_phase1);
++
++        match factor {
++            OsFactor::Off => f(x),
++            OsFactor::X2 => {
++                let (s0, s1) = self.stage_a.upsample(x, up0, up1);
++                let y0 = f(s0);
++                let y1 = f(s1);
++                self.stage_a.downsample(y0, y1, dn0, dn1)
++            }
++            OsFactor::X4 => {
++                // Outer stage: 1×→2×. Inner stage: 2×→4×.
++                let (a0, a1) = self.stage_a.upsample(x, up0, up1);
++                let (b0, b1) = self.stage_b.upsample(a0, up0, up1);
++                let (b2, b3) = self.stage_b.upsample(a1, up0, up1);
++                let c0 = f(b0);
++                let c1 = f(b1);
++                let c2 = f(b2);
++                let c3 = f(b3);
++                let d0 = self.stage_b.downsample(c0, c1, dn0, dn1);
++                let d1 = self.stage_b.downsample(c2, c3, dn0, dn1);
++                self.stage_a.downsample(d0, d1, dn0, dn1)
++            }
++        }
++    }
++}
+diff --git a/src/editor.rs b/src/editor.rs
+index 88368b8..d82e078 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -352,6 +352,9 @@ pub fn create(
+                     .min_col_width(90.0)
+                     .spacing([12.0, 5.0])
+                     .show(ui, |ui| {
++                        ui.label("Oversample");
++                        ui.add(widgets::ParamSlider::for_param(&params.oversample, setter));
++                        ui.end_row();
+                         ui.label("Ceiling");
+                         ui.add(widgets::ParamSlider::for_param(
+                             &params.limiter_threshold,
+diff --git a/src/lib.rs b/src/lib.rs
+index 3acaf5a..54d44c5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,9 @@ mod dsp;
+ mod editor;
+ mod params;
+ 
+-use dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, SineOsc};
++use dsp::{
++    shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
++};
+ use params::HardKickParams;
+ 
+ // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
+@@ -38,6 +40,7 @@ pub struct HardKick {
+     click_hp: BiquadFilter,
+     crossover: LRCrossover,
+     limiter: Limiter,
++    oversampler: Oversampler,
+ }
+ 
+ impl Default for HardKick {
+@@ -65,6 +68,7 @@ impl Default for HardKick {
+             click_hp: BiquadFilter::default(),
+             crossover: LRCrossover::default(),
+             limiter: Limiter::default(),
++            oversampler: Oversampler::default(),
+         }
+     }
+ }
+@@ -154,6 +158,7 @@ impl Plugin for HardKick {
+         self.click_hp.reset();
+         self.crossover.reset();
+         self.limiter.reset();
++        self.oversampler.reset();
+     }
+ 
+     fn process(
+@@ -245,12 +250,16 @@ impl Plugin for HardKick {
+                 let osc = self.osc.tick(freq);
+                 let (sub, high) = self.crossover.process(osc);
+                 let pre = self.pre_eq.process(high);
+-                let shaped = shape(
+-                    pre,
+-                    self.params.shaper.value(),
+-                    self.params.drive.value(),
+-                    self.params.bias.value(),
+-                );
++                // Oversample only the nonlinearity — it is the sole source of
++                // aliasing in the chain. Pre/post EQ are linear and stay at base rate.
++                let shaper = self.params.shaper.value();
++                let drive = self.params.drive.value();
++                let bias = self.params.bias.value();
++                let shaped = self
++                    .oversampler
++                    .process(pre, self.params.oversample.value(), |s| {
++                        shape(s, shaper, drive, bias)
++                    });
+                 let mix = self.params.dist_mix.value();
+                 let driven = self
+                     .post_eq
+diff --git a/src/params.rs b/src/params.rs
+index 8bbfca1..58ac7ff 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -1,4 +1,4 @@
+-use crate::dsp::Shaper;
++use crate::dsp::{OsFactor, Shaper};
+ use nih_plug::prelude::*;
+ 
+ #[derive(Params)]
+@@ -89,6 +89,11 @@ pub struct HardKickParams {
+     #[id = "crossover_freq"]
+     pub crossover_freq: FloatParam,
+ 
++    /// Oversampling factor for the waveshaper — suppresses aliasing by running
++    /// the nonlinearity at 2× or 4× the base sample rate.
++    #[id = "oversample"]
++    pub oversample: EnumParam<OsFactor>,
++
+     /// Output limiter ceiling in dBFS. The limiter prevents the output from
+     /// exceeding this level regardless of drive or level settings.
+     #[id = "limiter_threshold"]
+@@ -256,6 +261,10 @@ impl Default for HardKickParams {
+             .with_unit(" Hz")
+             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+ 
++            // Default 2× — a clear quality improvement over no oversampling
++            // without the CPU cost of 4×.
++            oversample: EnumParam::new("Oversample", OsFactor::X2),
++
+             limiter_threshold: FloatParam::new(
+                 "Limiter ceiling",
+                 -0.3,
+-- 
+2.43.0
+

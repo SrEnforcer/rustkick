@@ -1,0 +1,526 @@
+From 6a4c7068e1ef51e1d2119fb384c74bc771df2556 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 17 Jun 2026 21:50:37 +0000
+Subject: [PATCH] Add preset system, curated kicks, and WAV export (milestone
+ 8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Preset system:
+- src/presets.rs: 6 hand-tuned presets covering classic hardstyle, rawstyle
+  screech, minimal tek, sub pressure, industrial stomp, and floating bounce.
+- Preset strip in the UI (two rows of 3 buttons) above the parameter sections.
+  Clicking a preset applies all parameters instantly via ParamSetter.
+
+WAV export:
+- src/render.rs: standalone renderer — instantiates fresh DSP objects, runs
+  the full signal chain (crossover, oversampler, limiter) at 44.1 kHz, and
+  writes a 32-bit float mono WAV via the hound crate.
+- "Export WAV" button in the transport row; file lands at ~/hardkick-export.wav.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ Cargo.lock     |   7 ++
+ Cargo.toml     |   1 +
+ src/editor.rs  |  42 ++++++++-
+ src/lib.rs     |   4 +-
+ src/presets.rs | 251 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/render.rs  | 102 ++++++++++++++++++++
+ 6 files changed, 405 insertions(+), 2 deletions(-)
+ create mode 100644 src/presets.rs
+ create mode 100644 src/render.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index e1e4fe8..ba117e6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1006,6 +1006,7 @@ dependencies = [
+ name = "hardkick"
+ version = "0.1.0"
+ dependencies = [
++ "hound",
+  "nih_plug",
+  "nih_plug_egui",
+ ]
+@@ -1037,6 +1038,12 @@ version = "0.5.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+ 
++[[package]]
++name = "hound"
++version = "3.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
++
+ [[package]]
+ name = "indexmap"
+ version = "2.14.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index cc24d9a..929acae 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,7 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug", features = [
+     "standalone",
+ ] }
+ nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug" }
++hound = "3.5"
+ 
+ [profile.release]
+ opt-level = 3
+diff --git a/src/editor.rs b/src/editor.rs
+index d82e078..b66c67c 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -1,5 +1,7 @@
+ use crate::dsp::{shape, Shaper};
+ use crate::params::HardKickParams;
++use crate::presets;
++use crate::render::export_wav;
+ use nih_plug::context::gui::ParamSetter;
+ use nih_plug::prelude::Editor;
+ use nih_plug_egui::egui::epaint::StrokeKind;
+@@ -223,7 +225,35 @@ pub fn create(
+                 ui.add_space(4.0);
+ 
+                 kick_waveform(ui, &params);
+-                ui.add_space(6.0);
++                ui.add_space(4.0);
++
++                // ── PRESETS ──────────────────────────────────────────────────
++                section_header(ui, "PRESETS");
++                ui.add_space(4.0);
++                // Two rows of three preset buttons.
++                for row in presets::PRESETS.chunks(3) {
++                    ui.horizontal(|ui| {
++                        for preset in row {
++                            let btn = egui::Button::new(
++                                egui::RichText::new(preset.name)
++                                    .font(egui::FontId::monospace(9.5))
++                                    .color(ACCENT),
++                            )
++                            .fill(SECTION_BG)
++                            .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
++                            .min_size(egui::vec2(
++                                (ui.available_width() - 8.0) / row.len() as f32,
++                                22.0,
++                            ));
++                            if ui.add(btn).clicked() {
++                                presets::apply(preset, &params, setter);
++                            }
++                        }
++                    });
++                    ui.add_space(3.0);
++                }
++
++                ui.add_space(4.0);
+ 
+                 // ── PITCH ────────────────────────────────────────────────────
+                 section_header(ui, "PITCH");
+@@ -407,6 +437,16 @@ pub fn create(
+                     if ui.button("⚡  Trigger").clicked() {
+                         trigger.store(true, Ordering::Relaxed);
+                     }
++                    if ui.button("💾  Export WAV").clicked() {
++                        let path = format!(
++                            "{}/hardkick-export.wav",
++                            std::env::var("HOME").unwrap_or_else(|_| ".".into())
++                        );
++                        match export_wav(&params, &path) {
++                            Ok(()) => nih_plug::nih_log!("Exported to {}", path),
++                            Err(e) => nih_plug::nih_log!("Export failed: {}", e),
++                        }
++                    }
+                 });
+             });
+         },
+diff --git a/src/lib.rs b/src/lib.rs
+index 54d44c5..f0d1974 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,8 @@ use std::sync::{
+ mod dsp;
+ mod editor;
+ mod params;
++mod presets;
++mod render;
+ 
+ use dsp::{
+     shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
+@@ -47,7 +49,7 @@ impl Default for HardKick {
+     fn default() -> Self {
+         Self {
+             params: Arc::new(HardKickParams::default()),
+-            editor_state: EguiState::from_size(340, 920),
++            editor_state: EguiState::from_size(340, 1050),
+             trigger: Arc::new(AtomicBool::new(false)),
+             playing: Arc::new(AtomicBool::new(false)),
+             osc: SineOsc::new(44_100.0),
+diff --git a/src/presets.rs b/src/presets.rs
+new file mode 100644
+index 0000000..fe4d3d6
+--- /dev/null
++++ b/src/presets.rs
+@@ -0,0 +1,251 @@
++use crate::dsp::{OsFactor, Shaper};
++use crate::params::HardKickParams;
++use nih_plug::context::gui::ParamSetter;
++
++/// A complete snapshot of every plugin parameter.
++pub struct Preset {
++    pub name: &'static str,
++    // PITCH
++    pub pitch_start: f32,
++    pub pitch_end: f32,
++    pub decay: f32,
++    pub curve: f32,
++    // AMPLITUDE
++    pub amp_decay: f32,
++    pub amp_curve: f32,
++    pub level: f32,
++    // SHAPING
++    pub shaper: Shaper,
++    pub drive: f32,
++    pub bias: f32,
++    pub dist_mix: f32,
++    pub crossover_freq: f32,
++    // EQ
++    pub pre_eq_freq: f32,
++    pub pre_eq_q: f32,
++    pub pre_eq_gain: f32,
++    pub tone: f32,
++    // TRANSIENT
++    pub click_level: f32,
++    pub click_decay: f32,
++    pub click_tone: f32,
++    // OUTPUT
++    pub oversample: OsFactor,
++    pub limiter_threshold: f32,
++    pub limiter_release: f32,
++    // SEQUENCER
++    pub bpm: f32,
++}
++
++/// Apply all values from a preset to the live parameter set.
++pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
++    macro_rules! set {
++        ($param:expr, $val:expr) => {{
++            setter.begin_set_parameter(&$param);
++            setter.set_parameter(&$param, $val);
++            setter.end_set_parameter(&$param);
++        }};
++    }
++    set!(params.pitch_start, preset.pitch_start);
++    set!(params.pitch_end, preset.pitch_end);
++    set!(params.decay, preset.decay);
++    set!(params.curve, preset.curve);
++    set!(params.amp_decay, preset.amp_decay);
++    set!(params.amp_curve, preset.amp_curve);
++    set!(params.level, preset.level);
++    set!(params.shaper, preset.shaper);
++    set!(params.drive, preset.drive);
++    set!(params.bias, preset.bias);
++    set!(params.dist_mix, preset.dist_mix);
++    set!(params.crossover_freq, preset.crossover_freq);
++    set!(params.pre_eq_freq, preset.pre_eq_freq);
++    set!(params.pre_eq_q, preset.pre_eq_q);
++    set!(params.pre_eq_gain, preset.pre_eq_gain);
++    set!(params.tone, preset.tone);
++    set!(params.click_level, preset.click_level);
++    set!(params.click_decay, preset.click_decay);
++    set!(params.click_tone, preset.click_tone);
++    set!(params.oversample, preset.oversample);
++    set!(params.limiter_threshold, preset.limiter_threshold);
++    set!(params.limiter_release, preset.limiter_release);
++    set!(params.bpm, preset.bpm);
++}
++
++pub const PRESETS: &[Preset] = &[
++    // 1. Classic Hardstyle — deep pitch drop, clean sub, soft saturation, punchy click.
++    //    The reference point: heavy low end, smooth decay, no screech.
++    Preset {
++        name: "Classic Hard",
++        pitch_start: 180.0,
++        pitch_end: 45.0,
++        decay: 0.5,
++        curve: 3.0,
++        amp_decay: 0.6,
++        amp_curve: 1.2,
++        level: 0.85,
++        shaper: Shaper::Soft,
++        drive: 0.35,
++        bias: 0.0,
++        dist_mix: 1.0,
++        crossover_freq: 120.0,
++        pre_eq_freq: 2000.0,
++        pre_eq_q: 3.0,
++        pre_eq_gain: 0.0,
++        tone: -2.0,
++        click_level: 0.4,
++        click_decay: 5.0,
++        click_tone: 3000.0,
++        oversample: OsFactor::X2,
++        limiter_threshold: -0.3,
++        limiter_release: 100.0,
++        bpm: 150.0,
++    },
++
++    // 2. Raw Screech — the rawstyle "laser" tone: extreme pre-EQ boost into the
++    //    folder, asymmetric bias for even harmonics, crossover low so the sub
++    //    survives the carnage.
++    Preset {
++        name: "Raw Screech",
++        pitch_start: 200.0,
++        pitch_end: 50.0,
++        decay: 0.35,
++        curve: 4.5,
++        amp_decay: 0.45,
++        amp_curve: 1.5,
++        level: 0.80,
++        shaper: Shaper::Fold,
++        drive: 0.75,
++        bias: 0.25,
++        dist_mix: 1.0,
++        crossover_freq: 100.0,
++        pre_eq_freq: 2800.0,
++        pre_eq_q: 6.0,
++        pre_eq_gain: 18.0,
++        tone: -3.0,
++        click_level: 0.55,
++        click_decay: 3.0,
++        click_tone: 4000.0,
++        oversample: OsFactor::X4,
++        limiter_threshold: -0.3,
++        limiter_release: 80.0,
++        bpm: 150.0,
++    },
++
++    // 3. Minimal Tek — short, punchy, lo-fi. Hard clipper, almost no body, all
++    //    attack. Works well at higher BPMs.
++    Preset {
++        name: "Minimal Tek",
++        pitch_start: 130.0,
++        pitch_end: 55.0,
++        decay: 0.18,
++        curve: 2.0,
++        amp_decay: 0.22,
++        amp_curve: 2.0,
++        level: 0.90,
++        shaper: Shaper::Hard,
++        drive: 0.60,
++        bias: 0.10,
++        dist_mix: 1.0,
++        crossover_freq: 150.0,
++        pre_eq_freq: 1500.0,
++        pre_eq_q: 2.0,
++        pre_eq_gain: 4.0,
++        tone: 1.0,
++        click_level: 0.80,
++        click_decay: 2.0,
++        click_tone: 5000.0,
++        oversample: OsFactor::X2,
++        limiter_threshold: -0.5,
++        limiter_release: 60.0,
++        bpm: 160.0,
++    },
++
++    // 4. Sub Pressure — massive sub, very low crossover so almost the whole
++    //    signal stays clean, gentle drive only. Designed for maximum low-end
++    //    weight in a club system.
++    Preset {
++        name: "Sub Pressure",
++        pitch_start: 150.0,
++        pitch_end: 38.0,
++        decay: 0.70,
++        curve: 2.5,
++        amp_decay: 0.80,
++        amp_curve: 1.0,
++        level: 0.88,
++        shaper: Shaper::Soft,
++        drive: 0.20,
++        bias: 0.0,
++        dist_mix: 0.6,
++        crossover_freq: 80.0,
++        pre_eq_freq: 2000.0,
++        pre_eq_q: 3.0,
++        pre_eq_gain: 0.0,
++        tone: -4.0,
++        click_level: 0.20,
++        click_decay: 8.0,
++        click_tone: 2000.0,
++        oversample: OsFactor::X2,
++        limiter_threshold: -0.3,
++        limiter_release: 150.0,
++        bpm: 145.0,
++    },
++
++    // 5. Industrial Stomp — asymmetric hard clip, strong bias for a thick,
++    //    even-harmonic stack, sharp metallic click. More aggressive than rawstyle.
++    Preset {
++        name: "Industrial",
++        pitch_start: 220.0,
++        pitch_end: 55.0,
++        decay: 0.28,
++        curve: 5.0,
++        amp_decay: 0.32,
++        amp_curve: 1.8,
++        level: 0.82,
++        shaper: Shaper::Hard,
++        drive: 0.85,
++        bias: 0.40,
++        dist_mix: 1.0,
++        crossover_freq: 130.0,
++        pre_eq_freq: 3500.0,
++        pre_eq_q: 4.0,
++        pre_eq_gain: 8.0,
++        tone: 2.0,
++        click_level: 0.70,
++        click_decay: 1.5,
++        click_tone: 6000.0,
++        oversample: OsFactor::X4,
++        limiter_threshold: -0.5,
++        limiter_release: 50.0,
++        bpm: 155.0,
++    },
++
++    // 6. Floating Bounce — longer decay, slow curve, very soft saturation.
++    //    Warmer and more melodic than a typical hard kick; useful as a "colour"
++    //    kick underneath a main one or in slower uptempo tracks.
++    Preset {
++        name: "Floating",
++        pitch_start: 160.0,
++        pitch_end: 42.0,
++        decay: 0.90,
++        curve: 1.5,
++        amp_decay: 1.10,
++        amp_curve: 0.8,
++        level: 0.75,
++        shaper: Shaper::Soft,
++        drive: 0.15,
++        bias: 0.0,
++        dist_mix: 0.5,
++        crossover_freq: 100.0,
++        pre_eq_freq: 2000.0,
++        pre_eq_q: 3.0,
++        pre_eq_gain: 0.0,
++        tone: -1.0,
++        click_level: 0.10,
++        click_decay: 10.0,
++        click_tone: 1500.0,
++        oversample: OsFactor::X2,
++        limiter_threshold: -0.3,
++        limiter_release: 200.0,
++        bpm: 138.0,
++    },
++];
+diff --git a/src/render.rs b/src/render.rs
+new file mode 100644
+index 0000000..758a440
+--- /dev/null
++++ b/src/render.rs
+@@ -0,0 +1,102 @@
++use crate::dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler};
++use crate::params::HardKickParams;
++
++const SR: f32 = 44_100.0;
++
++fn lerp(a: f32, b: f32, t: f32) -> f32 {
++    a + (b - a) * t
++}
++
++/// Render a single kick shot from `params` at 44.1 kHz / 32-bit float and
++/// write it to `path` as a WAV file.
++///
++/// Runs entirely outside the process loop — no locks, no real-time constraints.
++pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
++    let amp_samples = (params.amp_decay.value() * SR) as usize;
++    // Give 20 ms of tail + limiter lookahead headroom.
++    let tail = (SR * 0.02) as usize + crate::dsp::limiter::LOOKAHEAD + 64;
++    let n_samples = amp_samples + tail;
++
++    // Fresh DSP state — independent of the live plugin instance.
++    let mut phase = 0.0_f32;
++    let mut pitch_env = Envelope::default();
++    let mut amp_env = Envelope::default();
++    let mut pre_eq = BiquadFilter::default();
++    let mut post_eq = BiquadFilter::default();
++    let mut dc_blocker = DcBlocker::default();
++    let mut crossover = LRCrossover::default();
++    let mut oversampler = Oversampler::default();
++    let mut limiter = Limiter::default();
++
++    // Recompute coefficients (same logic as lib.rs process()).
++    pre_eq.set_peaking(
++        params.pre_eq_freq.value(),
++        params.pre_eq_q.value(),
++        params.pre_eq_gain.value(),
++        SR,
++    );
++    post_eq.set_highshelf(4000.0, params.tone.value(), SR);
++    crossover.set_freq(params.crossover_freq.value(), SR);
++    limiter.set_params(
++        params.limiter_threshold.value(),
++        params.limiter_release.value(),
++        SR,
++    );
++
++    pitch_env.trigger();
++    amp_env.trigger();
++
++    let shaper = params.shaper.value();
++    let drive = params.drive.value();
++    let bias = params.bias.value();
++    let mix = params.dist_mix.value();
++    let level = params.level.value();
++    let os = params.oversample.value();
++
++    let mut buf = Vec::with_capacity(n_samples);
++
++    for _ in 0..n_samples {
++        let tonal = if amp_env.is_active() {
++            let pitch_t = pitch_env.tick(params.decay.value() * SR);
++            let shaped_t = pitch_t.powf(params.curve.value());
++            let start = params.pitch_start.value();
++            let end = params.pitch_end.value();
++            let freq = start * (end / start).powf(shaped_t);
++
++            let osc = (phase * std::f32::consts::TAU).sin();
++            phase = (phase + freq / SR).fract();
++
++            let (sub, high) = crossover.process(osc);
++            let pre = pre_eq.process(high);
++            let shaped = oversampler.process(pre, os, |s| shape(s, shaper, drive, bias));
++            let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));
++            let body = sub + driven;
++
++            let amp_t = amp_env.tick(params.amp_decay.value() * SR);
++            let amp = (1.0 - amp_t).powf(params.amp_curve.value()) * level;
++            body * amp
++        } else {
++            0.0
++        };
++
++        buf.push(limiter.process(tonal));
++    }
++
++    let spec = hound::WavSpec {
++        channels: 1,
++        sample_rate: SR as u32,
++        bits_per_sample: 32,
++        sample_format: hound::SampleFormat::Float,
++    };
++
++    let mut writer =
++        hound::WavWriter::create(path, spec).map_err(|e| format!("WAV create: {e}"))?;
++    for s in &buf {
++        writer
++            .write_sample(*s)
++            .map_err(|e| format!("WAV write: {e}"))?;
++    }
++    writer.finalize().map_err(|e| format!("WAV finalize: {e}"))?;
++
++    Ok(())
++}
+-- 
+2.43.0
+

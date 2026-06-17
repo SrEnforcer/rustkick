@@ -1,0 +1,261 @@
+From 36bc753735a5e6b74bd240b59a5b2eab83dbf11b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 17 Jun 2026 20:36:49 +0000
+Subject: [PATCH] Add Linkwitz-Riley crossover to protect sub band from
+ distortion (milestone 5)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+4th-order LR crossover (two cascaded Butterworth biquads) splits the oscillator
+signal at a user-controlled crossover frequency (default 150 Hz). The sub band
+passes clean to the output; only the high band goes through the pre-EQ →
+waveshaper → DC block → post-EQ chain, keeping the sub-bass tight and
+undistorted while the upper body takes the full drive.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/dsp/filter.rs | 88 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/dsp/mod.rs    |  2 +-
+ src/editor.rs     |  3 ++
+ src/lib.rs        | 19 ++++++----
+ src/params.rs     | 18 ++++++++++
+ 5 files changed, 123 insertions(+), 7 deletions(-)
+
+diff --git a/src/dsp/filter.rs b/src/dsp/filter.rs
+index 5bd8587..6c8b8b8 100644
+--- a/src/dsp/filter.rs
++++ b/src/dsp/filter.rs
+@@ -120,4 +120,92 @@ impl BiquadFilter {
+         self.z2 = self.b2 * x - self.a2 * y;
+         y
+     }
++
++    /// 2nd-order Butterworth lowpass (RBJ cookbook, Q = 1/√2 ≈ 0.7071).
++    pub fn set_lowpass_butterworth(&mut self, freq: f32, sample_rate: f32) {
++        let w0 = TAU * freq / sample_rate;
++        let cos_w0 = w0.cos();
++        let alpha = w0.sin() / (2.0_f32.sqrt());
++
++        let b0 = (1.0 - cos_w0) / 2.0;
++        let b1 = 1.0 - cos_w0;
++        let b2 = (1.0 - cos_w0) / 2.0;
++        let a0 = 1.0 + alpha;
++        let a1 = -2.0 * cos_w0;
++        let a2 = 1.0 - alpha;
++
++        self.b0 = b0 / a0;
++        self.b1 = b1 / a0;
++        self.b2 = b2 / a0;
++        self.a1 = a1 / a0;
++        self.a2 = a2 / a0;
++    }
++
++    /// 2nd-order Butterworth highpass (RBJ cookbook, Q = 1/√2 ≈ 0.7071).
++    pub fn set_highpass_butterworth(&mut self, freq: f32, sample_rate: f32) {
++        let w0 = TAU * freq / sample_rate;
++        let cos_w0 = w0.cos();
++        let alpha = w0.sin() / (2.0_f32.sqrt());
++
++        let b0 = (1.0 + cos_w0) / 2.0;
++        let b1 = -(1.0 + cos_w0);
++        let b2 = (1.0 + cos_w0) / 2.0;
++        let a0 = 1.0 + alpha;
++        let a1 = -2.0 * cos_w0;
++        let a2 = 1.0 - alpha;
++
++        self.b0 = b0 / a0;
++        self.b1 = b1 / a0;
++        self.b2 = b2 / a0;
++        self.a1 = a1 / a0;
++        self.a2 = a2 / a0;
++    }
++}
++
++/// 4th-order Linkwitz-Riley crossover — two cascaded 2nd-order Butterworth
++/// sections per band. The outputs sum to unity gain at all frequencies, with
++/// exactly 6 dB of attenuation at the crossover point for each band.
++pub struct LRCrossover {
++    lp1: BiquadFilter,
++    lp2: BiquadFilter,
++    hp1: BiquadFilter,
++    hp2: BiquadFilter,
++}
++
++impl Default for LRCrossover {
++    fn default() -> Self {
++        Self {
++            lp1: BiquadFilter::default(),
++            lp2: BiquadFilter::default(),
++            hp1: BiquadFilter::default(),
++            hp2: BiquadFilter::default(),
++        }
++    }
++}
++
++impl LRCrossover {
++    /// Update coefficients for the given crossover frequency. Call once per
++    /// buffer whenever the frequency parameter changes.
++    pub fn set_freq(&mut self, freq: f32, sample_rate: f32) {
++        self.lp1.set_lowpass_butterworth(freq, sample_rate);
++        self.lp2.set_lowpass_butterworth(freq, sample_rate);
++        self.hp1.set_highpass_butterworth(freq, sample_rate);
++        self.hp2.set_highpass_butterworth(freq, sample_rate);
++    }
++
++    /// Clears all delay lines.
++    pub fn reset(&mut self) {
++        self.lp1.reset();
++        self.lp2.reset();
++        self.hp1.reset();
++        self.hp2.reset();
++    }
++
++    /// Split one sample into `(sub, high)` bands.
++    #[inline]
++    pub fn process(&mut self, x: f32) -> (f32, f32) {
++        let sub = self.lp2.process(self.lp1.process(x));
++        let high = self.hp2.process(self.hp1.process(x));
++        (sub, high)
++    }
+ }
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index 7f5c946..b4251a2 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -6,6 +6,6 @@ pub mod osc;
+ 
+ pub use distortion::{shape, DcBlocker, Shaper};
+ pub use envelope::Envelope;
+-pub use filter::BiquadFilter;
++pub use filter::{BiquadFilter, LRCrossover};
+ pub use noise::Noise;
+ pub use osc::SineOsc;
+diff --git a/src/editor.rs b/src/editor.rs
+index a0ed392..501977d 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -283,6 +283,9 @@ pub fn create(
+                     .min_col_width(90.0)
+                     .spacing([12.0, 5.0])
+                     .show(ui, |ui| {
++                        ui.label("Crossover");
++                        ui.add(widgets::ParamSlider::for_param(&params.crossover_freq, setter));
++                        ui.end_row();
+                         ui.label("Drive");
+                         ui.add(widgets::ParamSlider::for_param(&params.drive, setter));
+                         ui.end_row();
+diff --git a/src/lib.rs b/src/lib.rs
+index 36f64ba..085705f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,7 @@ mod dsp;
+ mod editor;
+ mod params;
+ 
+-use dsp::{shape, BiquadFilter, DcBlocker, Envelope, Noise, SineOsc};
++use dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Noise, SineOsc};
+ use params::HardKickParams;
+ 
+ // ~1.5 ms at 44.1 kHz — long enough to be click-free, short enough to be inaudible.
+@@ -36,6 +36,7 @@ pub struct HardKick {
+     noise: Noise,
+     click_env: Envelope,
+     click_hp: BiquadFilter,
++    crossover: LRCrossover,
+ }
+ 
+ impl Default for HardKick {
+@@ -61,6 +62,7 @@ impl Default for HardKick {
+             noise: Noise::default(),
+             click_env: Envelope::default(),
+             click_hp: BiquadFilter::default(),
++            crossover: LRCrossover::default(),
+         }
+     }
+ }
+@@ -148,6 +150,7 @@ impl Plugin for HardKick {
+         self.post_eq.reset();
+         self.click_env = Envelope::default();
+         self.click_hp.reset();
++        self.crossover.reset();
+     }
+ 
+     fn process(
+@@ -173,6 +176,8 @@ impl Plugin for HardKick {
+             .set_highshelf(4000.0, self.params.tone.value(), self.sample_rate);
+         self.click_hp
+             .set_highpass(self.params.click_tone.value(), 0.707, self.sample_rate);
++        self.crossover
++            .set_freq(self.params.crossover_freq.value(), self.sample_rate);
+ 
+         if !playing {
+             self.beat_phase = 0.0;
+@@ -226,11 +231,12 @@ impl Plugin for HardKick {
+                 let end = self.params.pitch_end.value();
+                 let freq = start * (end / start).powf(shaped_t);
+ 
+-                // Signal path: osc → pre-EQ → shaper → DC block → post-EQ
+-                // Pre-EQ boosts a narrow band before the saturator; the non-linearity
+-                // then reacts asymmetrically to that band, generating the "screech".
++                // LR crossover splits the oscillator into sub and high bands.
++                // The sub band is passed clean; only the high band goes through
++                // the distortion chain so the sub-bass stays tight and undistorted.
+                 let osc = self.osc.tick(freq);
+-                let pre = self.pre_eq.process(osc);
++                let (sub, high) = self.crossover.process(osc);
++                let pre = self.pre_eq.process(high);
+                 let shaped = shape(
+                     pre,
+                     self.params.shaper.value(),
+@@ -238,9 +244,10 @@ impl Plugin for HardKick {
+                     self.params.bias.value(),
+                 );
+                 let mix = self.params.dist_mix.value();
+-                let body = self
++                let driven = self
+                     .post_eq
+                     .process(self.dc_blocker.process(lerp(pre, shaped, mix)));
++                let body = sub + driven;
+ 
+                 let amp_t = self
+                     .amp_env
+diff --git a/src/params.rs b/src/params.rs
+index 3049d37..ce73707 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -83,6 +83,12 @@ pub struct HardKickParams {
+     #[id = "click_tone"]
+     pub click_tone: FloatParam,
+ 
++    /// Linkwitz-Riley crossover frequency — signal below this is passed clean to
++    /// the output; only the band above it goes through the distortion chain.
++    /// Keeps the sub-bass tight and undistorted while the upper body gets driven.
++    #[id = "crossover_freq"]
++    pub crossover_freq: FloatParam,
++
+     /// Internal sequencer tempo in BPM.
+     #[id = "bpm"]
+     pub bpm: FloatParam,
+@@ -240,6 +246,18 @@ impl Default for HardKickParams {
+             .with_unit(" Hz")
+             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+ 
++            crossover_freq: FloatParam::new(
++                "Crossover",
++                150.0,
++                FloatRange::Skewed {
++                    min: 60.0,
++                    max: 400.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" Hz")
++            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
++
+             bpm: FloatParam::new(
+                 "BPM",
+                 150.0,
+-- 
+2.43.0
+
