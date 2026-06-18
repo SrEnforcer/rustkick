@@ -130,6 +130,27 @@ pub struct HardKickParams {
     /// Punch layer amplitude curve exponent — shapes how the burst fades.
     #[id = "punch_curve"]
     pub punch_curve: FloatParam,
+
+    /// Body compressor threshold in dB. Levels above this get squeezed
+    /// according to the ratio.
+    #[id = "comp_threshold"]
+    pub comp_threshold: FloatParam,
+
+    /// Body compressor ratio (1.0 = bypass). Higher = harder squeeze.
+    #[id = "comp_ratio"]
+    pub comp_ratio: FloatParam,
+
+    /// Body compressor attack time in milliseconds — how fast it clamps onsets.
+    #[id = "comp_attack"]
+    pub comp_attack: FloatParam,
+
+    /// Body compressor release time in milliseconds — pumping speed.
+    #[id = "comp_release"]
+    pub comp_release: FloatParam,
+
+    /// Body compressor make-up gain in dB to compensate for level loss.
+    #[id = "comp_makeup"]
+    pub comp_makeup: FloatParam,
 }
 
 impl Default for HardKickParams {
@@ -383,6 +404,60 @@ impl Default for HardKickParams {
                 FloatRange::Linear { min: 0.1, max: 8.0 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            // Default threshold -6 dB / ratio 1.0 — compressor is effectively
+            // bypassed until the user dials it in.
+            comp_threshold: FloatParam::new(
+                "Comp threshold",
+                -6.0,
+                FloatRange::Linear { min: -40.0, max: 0.0 },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            comp_ratio: FloatParam::new(
+                "Comp ratio",
+                1.0,
+                FloatRange::Skewed {
+                    min: 1.0,
+                    max: 20.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(":1")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            comp_attack: FloatParam::new(
+                "Comp attack",
+                3.0,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 50.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            comp_release: FloatParam::new(
+                "Comp release",
+                80.0,
+                FloatRange::Skewed {
+                    min: 5.0,
+                    max: 500.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
+
+            comp_makeup: FloatParam::new(
+                "Comp makeup",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 18.0 },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
         }
     }
 }

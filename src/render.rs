@@ -1,4 +1,6 @@
-use crate::dsp::{BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler, WaveShaper};
+use crate::dsp::{
+    BiquadFilter, Compressor, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler, WaveShaper,
+};
 use crate::params::HardKickParams;
 
 const SR: f32 = 44_100.0;
@@ -30,6 +32,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
     let mut oversampler = Oversampler::default();
     let mut limiter = Limiter::default();
     let mut wave_shaper = WaveShaper::default();
+    let mut body_comp = Compressor::default();
 
     // Recompute coefficients (same logic as lib.rs process()).
     pre_eq.set_peaking(
@@ -43,6 +46,14 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
     limiter.set_params(
         params.limiter_threshold.value(),
         params.limiter_release.value(),
+        SR,
+    );
+    body_comp.set_params(
+        params.comp_threshold.value(),
+        params.comp_ratio.value(),
+        params.comp_attack.value(),
+        params.comp_release.value(),
+        params.comp_makeup.value(),
         SR,
     );
 
@@ -84,6 +95,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
             let pre = pre_eq.process(high);
             let shaped = oversampler.process(pre, os, |s| wave_shaper.process(s, shaper, drive, bias));
             let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));
+            let driven = body_comp.process(driven);
             let body = sub + driven;
 
             let amp_t = amp_env.tick(params.amp_decay.value() * SR);

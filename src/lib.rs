@@ -12,8 +12,8 @@ mod presets;
 mod render;
 
 use dsp::{
-    BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
-    WaveShaper,
+    BiquadFilter, Compressor, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler,
+    SineOsc, WaveShaper,
 };
 use params::HardKickParams;
 
@@ -47,6 +47,7 @@ pub struct HardKick {
     limiter: Limiter,
     oversampler: Oversampler,
     wave_shaper: WaveShaper,
+    body_comp: Compressor,
     // Onset ramp — fades in amplitude over `onset_total` samples on each trigger,
     // preventing the click caused by an instantaneous jump from silence to full gain.
     onset_pos: u32,
@@ -82,6 +83,7 @@ impl Default for HardKick {
             limiter: Limiter::default(),
             oversampler: Oversampler::default(),
             wave_shaper: WaveShaper::default(),
+            body_comp: Compressor::default(),
             onset_pos: 0,
             onset_total: 0,
         }
@@ -125,6 +127,7 @@ impl HardKick {
         self.click_hp.reset();
         self.wave_shaper.reset();
         self.oversampler.reset();
+        self.body_comp.reset();
         // Capture the onset ramp length at trigger time so a mid-note param change
         // doesn't corrupt an in-progress ramp.
         let attack_ms = self.params.amp_attack.value();
@@ -193,6 +196,7 @@ impl Plugin for HardKick {
         self.limiter.reset();
         self.oversampler.reset();
         self.wave_shaper.reset();
+        self.body_comp.reset();
         self.onset_pos = 0;
         self.onset_total = 0;
     }
@@ -225,6 +229,14 @@ impl Plugin for HardKick {
         self.limiter.set_params(
             self.params.limiter_threshold.value(),
             self.params.limiter_release.value(),
+            self.sample_rate,
+        );
+        self.body_comp.set_params(
+            self.params.comp_threshold.value(),
+            self.params.comp_ratio.value(),
+            self.params.comp_attack.value(),
+            self.params.comp_release.value(),
+            self.params.comp_makeup.value(),
             self.sample_rate,
         );
 
@@ -314,6 +326,10 @@ impl Plugin for HardKick {
                 let driven = self
                     .post_eq
                     .process(self.dc_blocker.process(lerp(pre, shaped, mix)));
+                // Body compressor — squeezes the distorted high band into a
+                // denser, more "glued" sound. Sub band stays uncompressed to
+                // keep the low end's natural dynamics.
+                let driven = self.body_comp.process(driven);
                 let body = sub + driven;
 
                 let amp_t = self

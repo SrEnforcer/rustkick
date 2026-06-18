@@ -32,6 +32,11 @@ pub struct Preset {
     pub punch_freq: f32,
     pub punch_decay: f32,
     pub punch_curve: f32,
+    pub comp_threshold: f32,
+    pub comp_ratio: f32,
+    pub comp_attack: f32,
+    pub comp_release: f32,
+    pub comp_makeup: f32,
 }
 
 pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
@@ -70,6 +75,11 @@ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
     set!(params.punch_freq, preset.punch_freq);
     set!(params.punch_decay, preset.punch_decay);
     set!(params.punch_curve, preset.punch_curve);
+    set!(params.comp_threshold, preset.comp_threshold);
+    set!(params.comp_ratio, preset.comp_ratio);
+    set!(params.comp_attack, preset.comp_attack);
+    set!(params.comp_release, preset.comp_release);
+    set!(params.comp_makeup, preset.comp_makeup);
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -105,6 +115,11 @@ pub const PRESETS: &[Preset] = &[
         punch_freq: 220.0,
         punch_decay: 14.0,
         punch_curve: 2.5,
+        comp_threshold: -10.0,
+        comp_ratio: 4.0,
+        comp_attack: 5.0,
+        comp_release: 80.0,
+        comp_makeup: 4.0,
     },
 
     // Raw Screech — narrow pre-EQ peak boosted into the tube saturator generates
@@ -140,6 +155,11 @@ pub const PRESETS: &[Preset] = &[
         punch_freq: 280.0,
         punch_decay: 10.0,
         punch_curve: 3.0,
+        comp_threshold: -14.0,
+        comp_ratio: 6.0,
+        comp_attack: 2.0,
+        comp_release: 60.0,
+        comp_makeup: 6.0,
     },
 
     // Minimal Tek — short, punchy, hard-clipped. Almost all attack, minimal tail.
@@ -174,6 +194,11 @@ pub const PRESETS: &[Preset] = &[
         punch_freq: 320.0,
         punch_decay: 6.0,
         punch_curve: 3.5,
+        comp_threshold: -12.0,
+        comp_ratio: 8.0,
+        comp_attack: 1.0,
+        comp_release: 40.0,
+        comp_makeup: 5.0,
     },
 
     // Sub Pressure — maximum low-end weight. Crossover at 80 Hz keeps almost the
@@ -209,6 +234,11 @@ pub const PRESETS: &[Preset] = &[
         punch_freq: 180.0,
         punch_decay: 20.0,
         punch_curve: 2.0,
+        comp_threshold: -6.0,
+        comp_ratio: 2.0,
+        comp_attack: 10.0,
+        comp_release: 150.0,
+        comp_makeup: 2.0,
     },
 
     // Industrial — asymmetric hard-clip at high bias creates a thick stack of even
@@ -244,6 +274,11 @@ pub const PRESETS: &[Preset] = &[
         punch_freq: 350.0,
         punch_decay: 8.0,
         punch_curve: 3.0,
+        comp_threshold: -16.0,
+        comp_ratio: 10.0,
+        comp_attack: 1.5,
+        comp_release: 50.0,
+        comp_makeup: 7.0,
     },
 
     // Fold Metal — sine wavefolder with ADAA. The folding carves dense metallic
@@ -279,5 +314,10 @@ pub const PRESETS: &[Preset] = &[
         punch_freq: 260.0,
         punch_decay: 12.0,
         punch_curve: 2.8,
+        comp_threshold: -12.0,
+        comp_ratio: 6.0,
+        comp_attack: 3.0,
+        comp_release: 70.0,
+        comp_makeup: 5.0,
     },
 ];

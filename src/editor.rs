@@ -620,6 +620,15 @@ pub fn create(
                             knob(ui, "Curve", &params.punch_curve, setter);
                         });
 
+                        // COMP — body compressor on the distorted high band.
+                        panel(ui, "COMP  [body]", |ui| {
+                            knob(ui, "Thr", &params.comp_threshold, setter);
+                            knob(ui, "Ratio", &params.comp_ratio, setter);
+                            knob(ui, "Atk", &params.comp_attack, setter);
+                            knob(ui, "Rel", &params.comp_release, setter);
+                            knob(ui, "Makeup", &params.comp_makeup, setter);
+                        });
+
                         // SEQ — standalone audition BPM.
                         panel(ui, "SEQ", |ui| {
                             knob(ui, "BPM", &params.bpm, setter);
