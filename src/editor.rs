@@ -379,7 +379,7 @@ pub fn create(
                             "MODE",
                             params.shaper.value(),
                             &[
-                                (Shaper::Soft, "SOFT"),
+                                (Shaper::Tube, "TUBE"),
                                 (Shaper::Hard, "HARD"),
                                 (Shaper::Fold, "FOLD"),
                             ],

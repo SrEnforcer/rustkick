@@ -13,9 +13,11 @@ impl SineOsc {
         }
     }
 
-    /// Resets the oscillator to a zero-crossing, preventing clicks on retrigger.
+    /// Resets the oscillator phase to π/2 (peak) so the first output sample has
+    /// maximum amplitude — this is "phase locking", ensuring every trigger delivers
+    /// identical punch regardless of when in the previous cycle the retrigger fires.
     pub fn reset(&mut self) {
-        self.phase = 0.0;
+        self.phase = 0.25; // 0.25 cycles = π/2 radians = sin peak
     }
 
     pub fn tick(&mut self, freq: f32) -> f32 {

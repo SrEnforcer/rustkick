@@ -1,77 +1,138 @@
 use nih_plug::prelude::Enum;
+use std::f32::consts::PI;
 
-/// Waveshaping model that determines which kind of harmonics the distortion generates.
-///
-/// The choice between symmetric and asymmetric shaping is the difference between a
-/// hollow, square hardstyle tone (odd harmonics) and a richer, more aggressive
-/// rawstyle tone (both even and odd harmonics).
+/// Waveshaping model for the distortion stage.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shaper {
-    /// Symmetric soft clip (`tanh`) — odd harmonics, rounded saturation.
-    #[name = "Soft"]
-    Soft,
-    /// Hard clip — sharp, square distortion with strong odd harmonics.
+    /// Asymmetric triode saturation — generates both even and odd harmonics for the
+    /// thick, aggressive rawstyle body. Unlike plain tanh (odd-only), even harmonics
+    /// add warmth and weight that cuts through a dense mix.
+    #[name = "Tube"]
+    Tube,
+    /// Hard clip — sharp brickwall distortion, strong odd harmonics only.
     #[name = "Hard"]
     Hard,
-    /// Wavefolder — folds the signal back to carve metallic overtones (rawstyle).
+    /// Sine wavefolder with first-order ADAA — folds the signal back to carve
+    /// dense metallic overtones without the aliasing of naive folding.
     #[name = "Fold"]
     Fold,
 }
 
-/// Folds the signal back over a threshold an arbitrary number of times.
-///
-/// Unlike clipping (which caps the peak), a wavefolder mirrors the amplitude,
-/// producing a very dense harmonic structure. Adapted from the design report
-/// (DSP math of the hardstyle kick).
-fn hard_fold(input: f32, threshold: f32) -> f32 {
-    let sign = input.signum();
-    let x = input.abs();
-
-    if x > threshold {
-        let remainder = x % threshold;
-        let num_folds = (x / threshold).floor() as i32;
-        let y = if num_folds % 2 == 0 {
-            remainder
-        } else {
-            threshold - remainder
-        };
-        y * sign
-    } else {
-        input
-    }
-}
-
-/// Shapes a single sample according to the selected model.
-///
-/// `drive` (0.0..=1.0) controls the intensity and `bias` (0.0..=1.0) introduces
-/// asymmetry. A bias above zero shifts the operating point on the non-linear curve,
-/// generating even harmonics for a thicker, warmer tone. The output is always
-/// bounded to roughly [-1.0, 1.0].
+/// Stateless shaper for the editor waveform preview.
+/// Does not run ADAA (no state available); accuracy is "good enough" for display.
 pub fn shape(x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
-    // Map drive to a usable input gain.
-    let gain = 1.0 + drive * 24.0;
+    let gain = 1.0 + drive * 20.0;
     let driven = x * gain;
-
     match mode {
-        // Asymmetric tanh; the subtraction removes the resting DC offset that the
-        // bias introduces (a dedicated DC blocker downstream is still desirable).
-        Shaper::Soft => {
-            let b = bias * 0.9;
-            (driven + b).tanh() - b.tanh()
-        }
-        // Hard clip with asymmetric thresholds: a positive bias makes the bottom
-        // clip sooner than the top, which adds even harmonics.
-        Shaper::Hard => (driven + bias).clamp(-1.0, 1.0) - bias.clamp(-1.0, 1.0),
-        // Wavefolder around a fixed threshold of 1.0.
-        Shaper::Fold => hard_fold(driven, 1.0),
+        Shaper::Tube => triode(driven, drive, bias),
+        Shaper::Hard => (driven + bias * 0.9).clamp(-1.0, 1.0) - (bias * 0.9).clamp(-1.0, 1.0),
+        Shaper::Fold => (driven * PI * 0.5).sin(),
     }
 }
 
-/// First-order DC-blocking high-pass (~20 Hz) that removes the DC component
-/// introduced by asymmetric distortion.
+/// Asymmetric triode saturation model.
 ///
-/// Without this filter a static offset would eat headroom and cause floating
-/// sub frequencies on a PA system.
+/// `f(x) = (x-q)/(1-exp(-k(x-q))) + q/(1-exp(k*q))`
+///
+/// The second term is a DC correction so f(0) = 0 exactly.
+/// With q > 0 the curve is asymmetric: positive peaks are amplified more than negative
+/// peaks, generating even harmonics alongside the odd ones that any saturator produces.
+/// The final tanh bounds the output to (-1, 1).
+///
+/// `drive` → k  (saturation intensity)
+/// `bias`  → q  (operating-point shift, 0 = symmetric)
+#[inline]
+fn triode(x: f32, drive: f32, bias: f32) -> f32 {
+    let k = 1.0 + drive * 14.0;
+    let q = bias * 0.7;
+    let xq = x - q;
+
+    // Numerically stable body: L'Hopital limit as xq→0 is 1/k.
+    let body = if xq.abs() < 1e-5 {
+        1.0 / k
+    } else {
+        xq / (1.0 - (-k * xq).exp())
+    };
+
+    // DC correction: limit as q→0 of q/(1-exp(kq)) = -1/k.
+    let dc = if q.abs() < 1e-5 {
+        -1.0 / k
+    } else {
+        q / (1.0 - (k * q).exp())
+    };
+
+    (body + dc).tanh()
+}
+
+/// Antiderivative of the sine wavefolder f(x) = sin(x * π/2):
+/// F(x) = -(2/π) * cos(x * π/2)
+#[inline]
+fn fold_antiderivative(x: f32) -> f32 {
+    -(2.0 / PI) * (x * PI * 0.5).cos()
+}
+
+/// Stateful waveshaper that applies the selected mode per sample.
+///
+/// The Fold mode uses first-order Antiderivative Antialiasing (ADAA): instead of
+/// evaluating f(x) directly, it computes `(F(x) - F(x_prev)) / (x - x_prev)` where
+/// F is the closed-form antiderivative of the folder. This eliminates the aliasing
+/// products that would otherwise fold back from above Nyquist, giving cleaner
+/// metallic harmonics than naive folding or oversampling, at near-zero extra CPU cost.
+pub struct WaveShaper {
+    prev_x: f32,
+    prev_f: f32,
+}
+
+impl Default for WaveShaper {
+    fn default() -> Self {
+        Self {
+            prev_x: 0.0,
+            prev_f: fold_antiderivative(0.0),
+        }
+    }
+}
+
+impl WaveShaper {
+    pub fn reset(&mut self) {
+        self.prev_x = 0.0;
+        self.prev_f = fold_antiderivative(0.0);
+    }
+
+    #[inline]
+    pub fn process(&mut self, x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
+        let gain = 1.0 + drive * 20.0;
+        let driven = x * gain;
+        let out = match mode {
+            Shaper::Tube => triode(driven, drive, bias),
+            Shaper::Hard => {
+                let b = bias * 0.9;
+                (driven + b).clamp(-1.0, 1.0) - b.clamp(-1.0, 1.0)
+            }
+            Shaper::Fold => {
+                // First-order ADAA.
+                let cur_f = fold_antiderivative(driven);
+                let dx = driven - self.prev_x;
+                let y = if dx.abs() > 1e-5 {
+                    (cur_f - self.prev_f) / dx
+                } else {
+                    // Midpoint fallback when consecutive samples are too close.
+                    ((driven + self.prev_x) * PI * 0.25).sin()
+                };
+                self.prev_x = driven;
+                self.prev_f = cur_f;
+                y
+            }
+        };
+        if mode != Shaper::Fold {
+            self.prev_x = driven;
+            self.prev_f = fold_antiderivative(driven);
+        }
+        out
+    }
+}
+
+/// First-order DC-blocking high-pass (~20 Hz).
+/// Removes the DC offset introduced by asymmetric distortion.
 pub struct DcBlocker {
     x1: f32,
     y1: f32,
@@ -84,14 +145,12 @@ impl Default for DcBlocker {
 }
 
 impl DcBlocker {
-    /// Clears the internal state (on plugin reset).
     pub fn reset(&mut self) {
         self.x1 = 0.0;
         self.y1 = 0.0;
     }
 
-    /// Processes a single sample. The coefficient `R` sets the cutoff frequency;
-    /// 0.9995 sits around 20 Hz at 44.1 kHz.
+    #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         const R: f32 = 0.9995;
         let y = x - self.x1 + R * self.y1;

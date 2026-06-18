@@ -1,4 +1,4 @@
-use crate::dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler};
+use crate::dsp::{BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler, WaveShaper};
 use crate::params::HardKickParams;
 
 const SR: f32 = 44_100.0;
@@ -27,6 +27,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
     let mut crossover = LRCrossover::default();
     let mut oversampler = Oversampler::default();
     let mut limiter = Limiter::default();
+    let mut wave_shaper = WaveShaper::default();
 
     // Recompute coefficients (same logic as lib.rs process()).
     pre_eq.set_peaking(
@@ -68,7 +69,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
 
             let (sub, high) = crossover.process(osc);
             let pre = pre_eq.process(high);
-            let shaped = oversampler.process(pre, os, |s| shape(s, shaper, drive, bias));
+            let shaped = oversampler.process(pre, os, |s| wave_shaper.process(s, shaper, drive, bias));
             let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));
             let body = sub + driven;
 

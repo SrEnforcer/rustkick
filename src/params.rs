@@ -171,7 +171,7 @@ impl Default for HardKickParams {
 
             // Default Soft + drive 0.0 keeps the step-1 tone (clean sine) intact;
             // the user dials in the hardness deliberately.
-            shaper: EnumParam::new("Shaper", Shaper::Soft),
+            shaper: EnumParam::new("Shaper", Shaper::Tube),
 
             drive: FloatParam::new("Drive", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),

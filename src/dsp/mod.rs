@@ -6,7 +6,7 @@ pub mod noise;
 pub mod osc;
 pub mod oversample;
 
-pub use distortion::{shape, DcBlocker, Shaper};
+pub use distortion::{shape, DcBlocker, Shaper, WaveShaper};
 pub use envelope::Envelope;
 pub use filter::{BiquadFilter, LRCrossover};
 pub use limiter::Limiter;
