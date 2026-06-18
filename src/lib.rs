@@ -103,13 +103,22 @@ impl HardKick {
         }
     }
 
-    /// Resets the oscillator and (re)triggers all envelopes for a new kick.
+    /// Resets all DSP state and (re)triggers all envelopes for a new kick.
     fn fire(&mut self, velocity: f32) {
         self.velocity = velocity;
         self.osc.reset();
         self.pitch_env.trigger();
         self.amp_env.trigger();
         self.click_env.trigger();
+        // Clear filter delay lines so stale state from the previous note's tail
+        // doesn't cause a discontinuity (pop/crack) at the start of the new note.
+        self.crossover.reset();
+        self.pre_eq.reset();
+        self.dc_blocker.reset();
+        self.post_eq.reset();
+        self.click_hp.reset();
+        self.wave_shaper.reset();
+        self.oversampler.reset();
         // Capture the onset ramp length at trigger time so a mid-note param change
         // doesn't corrupt an in-progress ramp.
         let attack_ms = self.params.amp_attack.value();
