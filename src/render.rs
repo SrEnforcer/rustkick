@@ -19,8 +19,10 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
 
     // Fresh DSP state — independent of the live plugin instance.
     let mut phase = 0.0_f32;
+    let mut punch_phase = 0.0_f32;
     let mut pitch_env = Envelope::default();
     let mut amp_env = Envelope::default();
+    let mut punch_env = Envelope::default();
     let mut pre_eq = BiquadFilter::default();
     let mut post_eq = BiquadFilter::default();
     let mut dc_blocker = DcBlocker::default();
@@ -46,6 +48,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
 
     pitch_env.trigger();
     amp_env.trigger();
+    punch_env.trigger();
 
     let shaper = params.shaper.value();
     let drive = params.drive.value();
@@ -64,10 +67,20 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
             let end = params.pitch_end.value();
             let freq = start * (end / start).powf(shaped_t);
 
-            let osc = (phase * std::f32::consts::TAU).sin();
+            let osc_base = (phase * std::f32::consts::TAU).sin();
             phase = (phase + freq / SR).fract();
 
-            let (sub, high) = crossover.process(osc);
+            let punch = if punch_env.is_active() {
+                let pt = punch_env.tick(params.punch_decay.value() * 0.001 * SR);
+                let env = (1.0 - pt).powf(params.punch_curve.value());
+                let s = (punch_phase * std::f32::consts::TAU).sin();
+                punch_phase = (punch_phase + params.punch_freq.value() / SR).fract();
+                s * env * params.punch_level.value()
+            } else {
+                0.0
+            };
+
+            let (sub, high) = crossover.process(osc_base + punch);
             let pre = pre_eq.process(high);
             let shaped = oversampler.process(pre, os, |s| wave_shaper.process(s, shaper, drive, bias));
             let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));

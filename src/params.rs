@@ -112,6 +112,24 @@ pub struct HardKickParams {
     /// Internal sequencer tempo in BPM.
     #[id = "bpm"]
     pub bpm: FloatParam,
+
+    /// Punch layer level — a short tonal burst summed into the oscillator before
+    /// the crossover, giving an extra "klap" transient that can be distorted
+    /// along with the body. 0.0 disables the layer entirely.
+    #[id = "punch_level"]
+    pub punch_level: FloatParam,
+
+    /// Punch layer frequency in Hz — a fixed tonal pitch, typically 150–400 Hz.
+    #[id = "punch_freq"]
+    pub punch_freq: FloatParam,
+
+    /// Punch layer decay time in milliseconds — very short for a percussive smack.
+    #[id = "punch_decay"]
+    pub punch_decay: FloatParam,
+
+    /// Punch layer amplitude curve exponent — shapes how the burst fades.
+    #[id = "punch_curve"]
+    pub punch_curve: FloatParam,
 }
 
 impl Default for HardKickParams {
@@ -326,6 +344,45 @@ impl Default for HardKickParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            // Default 0 — punch layer is off until the user dials it in.
+            punch_level: FloatParam::new(
+                "Punch level",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            punch_freq: FloatParam::new(
+                "Punch freq",
+                220.0,
+                FloatRange::Skewed {
+                    min: 60.0,
+                    max: 600.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
+
+            punch_decay: FloatParam::new(
+                "Punch decay",
+                12.0,
+                FloatRange::Skewed {
+                    min: 2.0,
+                    max: 80.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            punch_curve: FloatParam::new(
+                "Punch curve",
+                2.0,
+                FloatRange::Linear { min: 0.1, max: 8.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
         }
     }
 }

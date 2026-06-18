@@ -602,6 +602,24 @@ pub fn create(
                             knob(ui, "Rel", &params.limiter_release, setter);
                         });
 
+                    });
+
+                    ui.add_space(4.0);
+
+                    // ── ROW 3: PUNCH | SEQ ──────────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = row_spacing;
+
+                        // PUNCH — short tonal burst summed into the oscillator
+                        // pre-crossover, giving an extra percussive "klap" that
+                        // also rides through the distortion chain.
+                        panel(ui, "PUNCH  [pre-xover, distorted]", |ui| {
+                            knob(ui, "Level", &params.punch_level, setter);
+                            knob(ui, "Freq", &params.punch_freq, setter);
+                            knob(ui, "Decay", &params.punch_decay, setter);
+                            knob(ui, "Curve", &params.punch_curve, setter);
+                        });
+
                         // SEQ — standalone audition BPM.
                         panel(ui, "SEQ", |ui| {
                             knob(ui, "BPM", &params.bpm, setter);

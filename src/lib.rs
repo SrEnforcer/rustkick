@@ -28,6 +28,8 @@ pub struct HardKick {
     osc: SineOsc,
     pitch_env: Envelope,
     amp_env: Envelope,
+    punch_osc: SineOsc,
+    punch_env: Envelope,
     velocity: f32,
     beat_phase: f32,
     was_playing: bool,
@@ -55,12 +57,14 @@ impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(780, 410),
+            editor_state: EguiState::from_size(780, 480),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
             pitch_env: Envelope::default(),
             amp_env: Envelope::default(),
+            punch_osc: SineOsc::new(44_100.0),
+            punch_env: Envelope::default(),
             velocity: 1.0,
             beat_phase: 0.0,
             was_playing: false,
@@ -107,9 +111,11 @@ impl HardKick {
     fn fire(&mut self, velocity: f32) {
         self.velocity = velocity;
         self.osc.reset();
+        self.punch_osc.reset();
         self.pitch_env.trigger();
         self.amp_env.trigger();
         self.click_env.trigger();
+        self.punch_env.trigger();
         // Clear filter delay lines so stale state from the previous note's tail
         // doesn't cause a discontinuity (pop/crack) at the start of the new note.
         self.crossover.reset();
@@ -172,8 +178,10 @@ impl Plugin for HardKick {
 
     fn reset(&mut self) {
         self.osc.reset();
+        self.punch_osc.reset();
         self.pitch_env = Envelope::default();
         self.amp_env = Envelope::default();
+        self.punch_env = Envelope::default();
         self.declick_counter = 0;
         self.pending_trigger = false;
         self.dc_blocker.reset();
@@ -272,10 +280,24 @@ impl Plugin for HardKick {
                 let end = self.params.pitch_end.value();
                 let freq = start * (end / start).powf(shaped_t);
 
+                // Punch layer — short tonal burst summed into the oscillator
+                // before the crossover so it can ride through the distortion
+                // chain together with the upper band of the body.
+                let punch = if self.punch_env.is_active() {
+                    let pd = self.params.punch_decay.value() * 0.001 * self.sample_rate;
+                    let pt = self.punch_env.tick(pd);
+                    let env = (1.0 - pt).powf(self.params.punch_curve.value());
+                    self.punch_osc.tick(self.params.punch_freq.value())
+                        * env
+                        * self.params.punch_level.value()
+                } else {
+                    0.0
+                };
+
                 // LR crossover splits the oscillator into sub and high bands.
                 // The sub band is passed clean; only the high band goes through
                 // the distortion chain so the sub-bass stays tight and undistorted.
-                let osc = self.osc.tick(freq);
+                let osc = self.osc.tick(freq) + punch;
                 let (sub, high) = self.crossover.process(osc);
                 let pre = self.pre_eq.process(high);
                 let shaper = self.params.shaper.value();
