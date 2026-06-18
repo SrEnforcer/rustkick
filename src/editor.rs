@@ -383,6 +383,220 @@ fn pitch_env_editor(ui: &mut egui::Ui, params: &HardKickParams, setter: &ParamSe
     r_mid.on_hover_text(format!("Curve: {:.2}", curve));
 }
 
+/// Graphical amplitude envelope editor.
+///
+/// Two draggable handles control amp_decay (right handle, horizontal position)
+/// and amp_curve (middle handle, vertical position). The shape is drawn from
+/// gain = (1 - t/decay)^curve over t ∈ [0, decay].
+fn amp_env_editor(ui: &mut egui::Ui, params: &HardKickParams, setter: &ParamSetter) {
+    let size = egui::vec2(160.0, 78.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let pad = egui::vec2(6.0, 6.0);
+    let plot = egui::Rect::from_min_max(rect.min + pad, rect.max - pad);
+
+    const T_MIN: f32 = 0.05;
+    const T_MAX: f32 = 2.0;
+    let time_to_x = |t: f32| -> f32 {
+        let n = (t.ln() - T_MIN.ln()) / (T_MAX.ln() - T_MIN.ln());
+        plot.left() + n.clamp(0.0, 1.0) * plot.width()
+    };
+    let x_to_time = |x: f32| -> f32 {
+        let n = ((x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+        (T_MIN.ln() + n * (T_MAX.ln() - T_MIN.ln())).exp()
+    };
+
+    let decay = params.amp_decay.value();
+    let curve = params.amp_curve.value();
+
+    let p_start = egui::pos2(plot.left(), plot.top());
+    let p_end = egui::pos2(time_to_x(decay), plot.bottom());
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, PANEL_BG);
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, ACCENT_DIM), StrokeKind::Inside);
+
+    const SEGS: usize = 80;
+    let mut prev: Option<egui::Pos2> = None;
+    for i in 0..=SEGS {
+        let t = i as f32 / SEGS as f32;
+        let g = (1.0 - t).powf(curve);
+        let p = egui::pos2(
+            plot.left() + t * (p_end.x - p_start.x),
+            plot.bottom() - g * plot.height(),
+        );
+        if let Some(pp) = prev {
+            painter.line_segment([pp, p], egui::Stroke::new(1.6, ACCENT));
+        }
+        prev = Some(p);
+    }
+
+    let mid_t = 0.5_f32;
+    let mid_g = 0.5_f32.powf(curve);
+    let p_mid = egui::pos2(
+        plot.left() + mid_t * (p_end.x - p_start.x),
+        plot.bottom() - mid_g * plot.height(),
+    );
+
+    let draw_handle = |painter: &egui::Painter, p: egui::Pos2, active: bool| {
+        let r = 5.0;
+        painter.circle_filled(p, r, if active { ACCENT } else { KNOB_BODY });
+        painter.circle_stroke(p, r, egui::Stroke::new(1.2, ACCENT));
+    };
+
+    let hit = |p: egui::Pos2| egui::Rect::from_center_size(p, egui::vec2(16.0, 16.0));
+    let id = ui.id().with("amp_env");
+    let r_end = ui.interact(hit(p_end), id.with("end"), egui::Sense::click_and_drag());
+    let r_mid = ui.interact(hit(p_mid), id.with("mid"), egui::Sense::click_and_drag());
+
+    if r_end.drag_started() {
+        setter.begin_set_parameter(&params.amp_decay);
+    }
+    if r_end.dragged() {
+        if let Some(pos) = r_end.interact_pointer_pos() {
+            setter.set_parameter(&params.amp_decay, x_to_time(pos.x).clamp(0.05, 2.0));
+        }
+    }
+    if r_end.drag_stopped() {
+        setter.end_set_parameter(&params.amp_decay);
+    }
+    if r_end.double_clicked() {
+        setter.begin_set_parameter(&params.amp_decay);
+        setter.set_parameter_normalized(
+            &params.amp_decay,
+            params.amp_decay.default_normalized_value(),
+        );
+        setter.end_set_parameter(&params.amp_decay);
+    }
+
+    if r_mid.drag_started() {
+        setter.begin_set_parameter(&params.amp_curve);
+    }
+    if r_mid.dragged() {
+        if let Some(pos) = r_mid.interact_pointer_pos() {
+            let g = ((plot.bottom() - pos.y) / plot.height()).clamp(1e-4, 1.0 - 1e-4);
+            let new_curve = g.ln() / 0.5_f32.ln();
+            setter.set_parameter(&params.amp_curve, new_curve.clamp(0.1, 8.0));
+        }
+    }
+    if r_mid.drag_stopped() {
+        setter.end_set_parameter(&params.amp_curve);
+    }
+    if r_mid.double_clicked() {
+        setter.begin_set_parameter(&params.amp_curve);
+        setter.set_parameter_normalized(
+            &params.amp_curve,
+            params.amp_curve.default_normalized_value(),
+        );
+        setter.end_set_parameter(&params.amp_curve);
+    }
+
+    draw_handle(&painter, p_mid, r_mid.hovered() || r_mid.dragged());
+    draw_handle(&painter, p_end, r_end.hovered() || r_end.dragged());
+
+    let txt = format!("{:.2} s   c={:.1}", decay, curve);
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        txt,
+        egui::FontId::monospace(8.5),
+        LABEL_DIM,
+    );
+
+    r_end.on_hover_text(format!("Decay: {:.2} s", decay));
+    r_mid.on_hover_text(format!("Curve: {:.2}", curve));
+}
+
+/// Two-dimensional drag pad — drives two FloatParams from a single point on a
+/// square. The X axis writes `px`, the Y axis writes `py` (top = max). Both
+/// use the params' own normalized 0..1 mapping.
+fn xy_pad<P: Param, Q: Param>(
+    ui: &mut egui::Ui,
+    caption: &str,
+    px: &P,
+    py: &Q,
+    setter: &ParamSetter,
+) {
+    let size = egui::vec2(78.0, 78.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let pad = 4.0;
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(pad, pad),
+        rect.max - egui::vec2(pad, pad + 10.0),
+    );
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, PANEL_BG);
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, ACCENT_DIM), StrokeKind::Inside);
+
+    let grid = egui::Color32::from_rgb(40, 32, 60);
+    painter.line_segment(
+        [egui::pos2(plot.center().x, plot.top()), egui::pos2(plot.center().x, plot.bottom())],
+        egui::Stroke::new(0.5, grid),
+    );
+    painter.line_segment(
+        [egui::pos2(plot.left(), plot.center().y), egui::pos2(plot.right(), plot.center().y)],
+        egui::Stroke::new(0.5, grid),
+    );
+
+    let tx = px.unmodulated_normalized_value();
+    let ty = py.unmodulated_normalized_value();
+    let p = egui::pos2(
+        plot.left() + tx * plot.width(),
+        plot.bottom() - ty * plot.height(),
+    );
+
+    let resp = ui.interact(plot, ui.id().with(("xy", caption)), egui::Sense::click_and_drag());
+    if resp.drag_started() {
+        setter.begin_set_parameter(px);
+        setter.begin_set_parameter(py);
+    }
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let nx = ((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+            let ny = ((plot.bottom() - pos.y) / plot.height()).clamp(0.0, 1.0);
+            setter.set_parameter_normalized(px, nx);
+            setter.set_parameter_normalized(py, ny);
+        }
+    }
+    if resp.drag_stopped() {
+        setter.end_set_parameter(px);
+        setter.end_set_parameter(py);
+    }
+    if resp.double_clicked() {
+        setter.begin_set_parameter(px);
+        setter.set_parameter_normalized(px, px.default_normalized_value());
+        setter.end_set_parameter(px);
+        setter.begin_set_parameter(py);
+        setter.set_parameter_normalized(py, py.default_normalized_value());
+        setter.end_set_parameter(py);
+    }
+
+    painter.circle_filled(p, 4.5, ACCENT);
+    painter.circle_stroke(p, 4.5, egui::Stroke::new(1.0, LABEL));
+
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        caption,
+        egui::FontId::monospace(8.5),
+        LABEL,
+    );
+
+    resp.on_hover_text(format!(
+        "{}: {} · {}: {}",
+        px.name(),
+        px.normalized_value_to_string(tx, true),
+        py.name(),
+        py.normalized_value_to_string(ty, true),
+    ));
+}
+
 fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
     const N: usize = 512;
     let sr = 44_100.0_f32;
@@ -528,11 +742,10 @@ pub fn create(
                             pitch_env_editor(ui, &params, setter);
                         });
 
-                        // AMP — amplitude envelope.
-                        panel(ui, "AMP", |ui| {
+                        // AMP — graphical decay/curve editor + attack and master level.
+                        panel(ui, "AMP ENV", |ui| {
+                            amp_env_editor(ui, &params, setter);
                             knob(ui, "Atk", &params.amp_attack, setter);
-                            knob(ui, "Decay", &params.amp_decay, setter);
-                            knob(ui, "Curve", &params.amp_curve, setter);
                             knob(ui, "Level", &params.level, setter);
                         });
 
@@ -568,8 +781,7 @@ pub fn create(
                                 },
                             );
                             knob(ui, "Xover", &params.crossover_freq, setter);
-                            knob(ui, "Drive", &params.drive, setter);
-                            knob(ui, "Bias", &params.bias, setter);
+                            xy_pad(ui, "DRIVE × BIAS", &params.drive, &params.bias, setter);
                             knob(ui, "Mix", &params.dist_mix, setter);
                         });
 
