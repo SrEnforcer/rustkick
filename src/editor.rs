@@ -186,6 +186,203 @@ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+/// Graphical pitch envelope editor.
+///
+/// Three draggable handles directly control the four scalar pitch params:
+/// - left handle: pitch_start (vertical = frequency, log axis)
+/// - right handle: pitch_end (vertical) + decay (horizontal = time, log axis)
+/// - middle handle: curve exponent (vertical drag reshapes the curve)
+///
+/// The frequency axis is shared between start and end (log 20–800 Hz); each
+/// handle's own param range clamps it. The time axis is log 0.05–2.0 s.
+fn pitch_env_editor(ui: &mut egui::Ui, params: &HardKickParams, setter: &ParamSetter) {
+    let size = egui::vec2(260.0, 110.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let pad = egui::vec2(6.0, 6.0);
+    let plot = egui::Rect::from_min_max(rect.min + pad, rect.max - pad);
+
+    // Log mappings.
+    const F_MIN: f32 = 20.0;
+    const F_MAX: f32 = 800.0;
+    const T_MIN: f32 = 0.05;
+    const T_MAX: f32 = 2.0;
+    let freq_to_y = |f: f32| -> f32 {
+        let n = (f.ln() - F_MIN.ln()) / (F_MAX.ln() - F_MIN.ln());
+        plot.bottom() - n.clamp(0.0, 1.0) * plot.height()
+    };
+    let y_to_freq = |y: f32| -> f32 {
+        let n = ((plot.bottom() - y) / plot.height()).clamp(0.0, 1.0);
+        (F_MIN.ln() + n * (F_MAX.ln() - F_MIN.ln())).exp()
+    };
+    let time_to_x = |t: f32| -> f32 {
+        let n = (t.ln() - T_MIN.ln()) / (T_MAX.ln() - T_MIN.ln());
+        plot.left() + n.clamp(0.0, 1.0) * plot.width()
+    };
+    let x_to_time = |x: f32| -> f32 {
+        let n = ((x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+        (T_MIN.ln() + n * (T_MAX.ln() - T_MIN.ln())).exp()
+    };
+
+    let start = params.pitch_start.value();
+    let end = params.pitch_end.value();
+    let decay = params.decay.value();
+    let curve = params.curve.value();
+
+    let p_start = egui::pos2(plot.left(), freq_to_y(start));
+    let p_end = egui::pos2(time_to_x(decay), freq_to_y(end));
+
+    // Draw background and gridlines.
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, PANEL_BG);
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, ACCENT_DIM), StrokeKind::Inside);
+    let grid = egui::Color32::from_rgb(40, 32, 60);
+    for &hz in &[50.0_f32, 100.0, 200.0, 400.0] {
+        let y = freq_to_y(hz);
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            egui::Stroke::new(0.5, grid),
+        );
+    }
+
+    // Render the curve as a polyline.
+    const SEGS: usize = 80;
+    let mut prev: Option<egui::Pos2> = None;
+    for i in 0..=SEGS {
+        let t = i as f32 / SEGS as f32;
+        let shaped = t.powf(curve);
+        let f = start * (end / start).powf(shaped);
+        let p = egui::pos2(
+            plot.left() + t * (p_end.x - p_start.x),
+            freq_to_y(f),
+        );
+        if let Some(pp) = prev {
+            painter.line_segment([pp, p], egui::Stroke::new(1.6, ACCENT));
+        }
+        prev = Some(p);
+    }
+
+    // Mid handle position: sample the curve at t=0.5.
+    let mid_t = 0.5_f32;
+    let mid_shaped = mid_t.powf(curve);
+    let mid_freq = start * (end / start).powf(mid_shaped);
+    let p_mid = egui::pos2(
+        plot.left() + mid_t * (p_end.x - p_start.x),
+        freq_to_y(mid_freq),
+    );
+
+    // Draw a marker handle.
+    let draw_handle = |painter: &egui::Painter, p: egui::Pos2, active: bool| {
+        let r = 5.5;
+        painter.circle_filled(p, r, if active { ACCENT } else { KNOB_BODY });
+        painter.circle_stroke(p, r, egui::Stroke::new(1.2, ACCENT));
+    };
+
+    // Interactions — each handle gets its own small hit rect.
+    let hit = |p: egui::Pos2| egui::Rect::from_center_size(p, egui::vec2(18.0, 18.0));
+
+    let id = ui.id().with("pitch_env");
+    let r_start = ui.interact(hit(p_start), id.with("start"), egui::Sense::click_and_drag());
+    let r_end = ui.interact(hit(p_end), id.with("end"), egui::Sense::click_and_drag());
+    let r_mid = ui.interact(hit(p_mid), id.with("mid"), egui::Sense::click_and_drag());
+
+    if r_start.drag_started() {
+        setter.begin_set_parameter(&params.pitch_start);
+    }
+    if r_start.dragged() {
+        if let Some(pos) = r_start.interact_pointer_pos() {
+            let new = y_to_freq(pos.y).clamp(20.0, 800.0);
+            setter.set_parameter(&params.pitch_start, new);
+        }
+    }
+    if r_start.drag_stopped() {
+        setter.end_set_parameter(&params.pitch_start);
+    }
+    if r_start.double_clicked() {
+        setter.begin_set_parameter(&params.pitch_start);
+        setter.set_parameter_normalized(
+            &params.pitch_start,
+            params.pitch_start.default_normalized_value(),
+        );
+        setter.end_set_parameter(&params.pitch_start);
+    }
+
+    if r_end.drag_started() {
+        setter.begin_set_parameter(&params.pitch_end);
+        setter.begin_set_parameter(&params.decay);
+    }
+    if r_end.dragged() {
+        if let Some(pos) = r_end.interact_pointer_pos() {
+            let new_f = y_to_freq(pos.y).clamp(20.0, 200.0);
+            let new_t = x_to_time(pos.x).clamp(0.05, 2.0);
+            setter.set_parameter(&params.pitch_end, new_f);
+            setter.set_parameter(&params.decay, new_t);
+        }
+    }
+    if r_end.drag_stopped() {
+        setter.end_set_parameter(&params.pitch_end);
+        setter.end_set_parameter(&params.decay);
+    }
+    if r_end.double_clicked() {
+        setter.begin_set_parameter(&params.pitch_end);
+        setter.set_parameter_normalized(
+            &params.pitch_end,
+            params.pitch_end.default_normalized_value(),
+        );
+        setter.end_set_parameter(&params.pitch_end);
+        setter.begin_set_parameter(&params.decay);
+        setter.set_parameter_normalized(&params.decay, params.decay.default_normalized_value());
+        setter.end_set_parameter(&params.decay);
+    }
+
+    if r_mid.drag_started() {
+        setter.begin_set_parameter(&params.curve);
+    }
+    if r_mid.dragged() {
+        if let Some(pos) = r_mid.interact_pointer_pos() {
+            // Map the pointer y back to a freq, then invert the curve formula:
+            // freq = start * (end/start)^(0.5^curve)  ⇒  0.5^curve = log(freq/start)/log(end/start)
+            let target = y_to_freq(pos.y).clamp(end.min(start) + 0.01, start.max(end) - 0.01);
+            let ratio = (target / start).ln() / (end / start).ln();
+            let ratio = ratio.clamp(1e-4, 1.0 - 1e-4);
+            let new_curve = ratio.ln() / 0.5_f32.ln();
+            setter.set_parameter(&params.curve, new_curve.clamp(0.1, 8.0));
+        }
+    }
+    if r_mid.drag_stopped() {
+        setter.end_set_parameter(&params.curve);
+    }
+    if r_mid.double_clicked() {
+        setter.begin_set_parameter(&params.curve);
+        setter.set_parameter_normalized(&params.curve, params.curve.default_normalized_value());
+        setter.end_set_parameter(&params.curve);
+    }
+
+    draw_handle(&painter, p_mid, r_mid.hovered() || r_mid.dragged());
+    draw_handle(&painter, p_start, r_start.hovered() || r_start.dragged());
+    draw_handle(&painter, p_end, r_end.hovered() || r_end.dragged());
+
+    // Numeric readout under the plot.
+    let txt = format!(
+        "{:>4.0} → {:>3.0} Hz   {:.2} s   c={:.1}",
+        start, end, decay, curve
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        txt,
+        egui::FontId::monospace(8.5),
+        LABEL_DIM,
+    );
+
+    r_start.on_hover_text(format!("Start: {:.1} Hz", start));
+    r_end.on_hover_text(format!("End: {:.1} Hz · Decay: {:.2} s", end, decay));
+    r_mid.on_hover_text(format!("Curve: {:.2}", curve));
+}
+
 fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
     const N: usize = 512;
     let sr = 44_100.0_f32;
@@ -326,12 +523,9 @@ pub fn create(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = row_spacing;
 
-                        // PITCH — exponential sweep parameters.
-                        panel(ui, "PITCH", |ui| {
-                            knob(ui, "Start", &params.pitch_start, setter);
-                            knob(ui, "End", &params.pitch_end, setter);
-                            knob(ui, "Decay", &params.decay, setter);
-                            knob(ui, "Curve", &params.curve, setter);
+                        // PITCH — interactive curve editor (drag handles on the graph).
+                        panel(ui, "PITCH ENV", |ui| {
+                            pitch_env_editor(ui, &params, setter);
                         });
 
                         // AMP — amplitude envelope.
