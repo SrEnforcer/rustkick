@@ -1,0 +1,357 @@
+From 320df8c6c2bd4c5196a8520220366e55b728ca6a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 18 Jun 2026 21:18:02 +0000
+Subject: [PATCH] =?UTF-8?q?Phase=202:=20Punch=20layer=20=E2=80=94=20second?=
+ =?UTF-8?q?=20oscillator=20for=20percussive=20klap?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a short tonal burst summed into the oscillator before the crossover
+so it rides through the distortion chain together with the body's upper
+band, giving the kick an extra percussive "klap" transient distinct from
+the noise-based click layer (which mixes in parallel after distortion).
+
+Params:
+- punch_level (0..1, default 0)
+- punch_freq (60..600 Hz, default 220)
+- punch_decay (2..80 ms, default 12)
+- punch_curve (0.1..8, default 2.0)
+
+A dedicated SineOsc and Envelope are reset/triggered alongside the main
+ones in fire() and reset(). The render path mirrors the same signal flow
+for WAV export. All six presets gained punch defaults tuned to character.
+UI grew a PUNCH panel in a new third row; window height bumped to 480.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GwURq9bT1AzMqUHKVyWkmv
+---
+ src/editor.rs  | 18 ++++++++++++++++
+ src/lib.rs     | 26 +++++++++++++++++++++--
+ src/params.rs  | 57 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/presets.rs | 32 ++++++++++++++++++++++++++++
+ src/render.rs  | 17 +++++++++++++--
+ 5 files changed, 146 insertions(+), 4 deletions(-)
+
+diff --git a/src/editor.rs b/src/editor.rs
+index a95ff8b..53c50dc 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -602,6 +602,24 @@ pub fn create(
+                             knob(ui, "Rel", &params.limiter_release, setter);
+                         });
+ 
++                    });
++
++                    ui.add_space(4.0);
++
++                    // ── ROW 3: PUNCH | SEQ ──────────────────────────────────
++                    ui.horizontal(|ui| {
++                        ui.spacing_mut().item_spacing = row_spacing;
++
++                        // PUNCH — short tonal burst summed into the oscillator
++                        // pre-crossover, giving an extra percussive "klap" that
++                        // also rides through the distortion chain.
++                        panel(ui, "PUNCH  [pre-xover, distorted]", |ui| {
++                            knob(ui, "Level", &params.punch_level, setter);
++                            knob(ui, "Freq", &params.punch_freq, setter);
++                            knob(ui, "Decay", &params.punch_decay, setter);
++                            knob(ui, "Curve", &params.punch_curve, setter);
++                        });
++
+                         // SEQ — standalone audition BPM.
+                         panel(ui, "SEQ", |ui| {
+                             knob(ui, "BPM", &params.bpm, setter);
+diff --git a/src/lib.rs b/src/lib.rs
+index c50dc94..33462ae 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,6 +28,8 @@ pub struct HardKick {
+     osc: SineOsc,
+     pitch_env: Envelope,
+     amp_env: Envelope,
++    punch_osc: SineOsc,
++    punch_env: Envelope,
+     velocity: f32,
+     beat_phase: f32,
+     was_playing: bool,
+@@ -55,12 +57,14 @@ impl Default for HardKick {
+     fn default() -> Self {
+         Self {
+             params: Arc::new(HardKickParams::default()),
+-            editor_state: EguiState::from_size(780, 410),
++            editor_state: EguiState::from_size(780, 480),
+             trigger: Arc::new(AtomicBool::new(false)),
+             playing: Arc::new(AtomicBool::new(false)),
+             osc: SineOsc::new(44_100.0),
+             pitch_env: Envelope::default(),
+             amp_env: Envelope::default(),
++            punch_osc: SineOsc::new(44_100.0),
++            punch_env: Envelope::default(),
+             velocity: 1.0,
+             beat_phase: 0.0,
+             was_playing: false,
+@@ -107,9 +111,11 @@ impl HardKick {
+     fn fire(&mut self, velocity: f32) {
+         self.velocity = velocity;
+         self.osc.reset();
++        self.punch_osc.reset();
+         self.pitch_env.trigger();
+         self.amp_env.trigger();
+         self.click_env.trigger();
++        self.punch_env.trigger();
+         // Clear filter delay lines so stale state from the previous note's tail
+         // doesn't cause a discontinuity (pop/crack) at the start of the new note.
+         self.crossover.reset();
+@@ -172,8 +178,10 @@ impl Plugin for HardKick {
+ 
+     fn reset(&mut self) {
+         self.osc.reset();
++        self.punch_osc.reset();
+         self.pitch_env = Envelope::default();
+         self.amp_env = Envelope::default();
++        self.punch_env = Envelope::default();
+         self.declick_counter = 0;
+         self.pending_trigger = false;
+         self.dc_blocker.reset();
+@@ -272,10 +280,24 @@ impl Plugin for HardKick {
+                 let end = self.params.pitch_end.value();
+                 let freq = start * (end / start).powf(shaped_t);
+ 
++                // Punch layer — short tonal burst summed into the oscillator
++                // before the crossover so it can ride through the distortion
++                // chain together with the upper band of the body.
++                let punch = if self.punch_env.is_active() {
++                    let pd = self.params.punch_decay.value() * 0.001 * self.sample_rate;
++                    let pt = self.punch_env.tick(pd);
++                    let env = (1.0 - pt).powf(self.params.punch_curve.value());
++                    self.punch_osc.tick(self.params.punch_freq.value())
++                        * env
++                        * self.params.punch_level.value()
++                } else {
++                    0.0
++                };
++
+                 // LR crossover splits the oscillator into sub and high bands.
+                 // The sub band is passed clean; only the high band goes through
+                 // the distortion chain so the sub-bass stays tight and undistorted.
+-                let osc = self.osc.tick(freq);
++                let osc = self.osc.tick(freq) + punch;
+                 let (sub, high) = self.crossover.process(osc);
+                 let pre = self.pre_eq.process(high);
+                 let shaper = self.params.shaper.value();
+diff --git a/src/params.rs b/src/params.rs
+index 130b1aa..d1fc228 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -112,6 +112,24 @@ pub struct HardKickParams {
+     /// Internal sequencer tempo in BPM.
+     #[id = "bpm"]
+     pub bpm: FloatParam,
++
++    /// Punch layer level — a short tonal burst summed into the oscillator before
++    /// the crossover, giving an extra "klap" transient that can be distorted
++    /// along with the body. 0.0 disables the layer entirely.
++    #[id = "punch_level"]
++    pub punch_level: FloatParam,
++
++    /// Punch layer frequency in Hz — a fixed tonal pitch, typically 150–400 Hz.
++    #[id = "punch_freq"]
++    pub punch_freq: FloatParam,
++
++    /// Punch layer decay time in milliseconds — very short for a percussive smack.
++    #[id = "punch_decay"]
++    pub punch_decay: FloatParam,
++
++    /// Punch layer amplitude curve exponent — shapes how the burst fades.
++    #[id = "punch_curve"]
++    pub punch_curve: FloatParam,
+ }
+ 
+ impl Default for HardKickParams {
+@@ -326,6 +344,45 @@ impl Default for HardKickParams {
+                 },
+             )
+             .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
++            // Default 0 — punch layer is off until the user dials it in.
++            punch_level: FloatParam::new(
++                "Punch level",
++                0.0,
++                FloatRange::Linear { min: 0.0, max: 1.0 },
++            )
++            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            punch_freq: FloatParam::new(
++                "Punch freq",
++                220.0,
++                FloatRange::Skewed {
++                    min: 60.0,
++                    max: 600.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" Hz")
++            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
++
++            punch_decay: FloatParam::new(
++                "Punch decay",
++                12.0,
++                FloatRange::Skewed {
++                    min: 2.0,
++                    max: 80.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" ms")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
++            punch_curve: FloatParam::new(
++                "Punch curve",
++                2.0,
++                FloatRange::Linear { min: 0.1, max: 8.0 },
++            )
++            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+         }
+     }
+ }
+diff --git a/src/presets.rs b/src/presets.rs
+index d12b1a3..959899b 100644
+--- a/src/presets.rs
++++ b/src/presets.rs
+@@ -28,6 +28,10 @@ pub struct Preset {
+     pub limiter_threshold: f32,
+     pub limiter_release: f32,
+     pub bpm: f32,
++    pub punch_level: f32,
++    pub punch_freq: f32,
++    pub punch_decay: f32,
++    pub punch_curve: f32,
+ }
+ 
+ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+@@ -62,6 +66,10 @@ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+     set!(params.limiter_threshold, preset.limiter_threshold);
+     set!(params.limiter_release, preset.limiter_release);
+     set!(params.bpm, preset.bpm);
++    set!(params.punch_level, preset.punch_level);
++    set!(params.punch_freq, preset.punch_freq);
++    set!(params.punch_decay, preset.punch_decay);
++    set!(params.punch_curve, preset.punch_curve);
+ }
+ 
+ pub const PRESETS: &[Preset] = &[
+@@ -93,6 +101,10 @@ pub const PRESETS: &[Preset] = &[
+         limiter_threshold: -0.5,
+         limiter_release: 100.0,
+         bpm: 150.0,
++        punch_level: 0.35,
++        punch_freq: 220.0,
++        punch_decay: 14.0,
++        punch_curve: 2.5,
+     },
+ 
+     // Raw Screech — narrow pre-EQ peak boosted into the tube saturator generates
+@@ -124,6 +136,10 @@ pub const PRESETS: &[Preset] = &[
+         limiter_threshold: -0.5,
+         limiter_release: 80.0,
+         bpm: 150.0,
++        punch_level: 0.45,
++        punch_freq: 280.0,
++        punch_decay: 10.0,
++        punch_curve: 3.0,
+     },
+ 
+     // Minimal Tek — short, punchy, hard-clipped. Almost all attack, minimal tail.
+@@ -154,6 +170,10 @@ pub const PRESETS: &[Preset] = &[
+         limiter_threshold: -0.5,
+         limiter_release: 60.0,
+         bpm: 160.0,
++        punch_level: 0.55,
++        punch_freq: 320.0,
++        punch_decay: 6.0,
++        punch_curve: 3.5,
+     },
+ 
+     // Sub Pressure — maximum low-end weight. Crossover at 80 Hz keeps almost the
+@@ -185,6 +205,10 @@ pub const PRESETS: &[Preset] = &[
+         limiter_threshold: -0.5,
+         limiter_release: 150.0,
+         bpm: 145.0,
++        punch_level: 0.20,
++        punch_freq: 180.0,
++        punch_decay: 20.0,
++        punch_curve: 2.0,
+     },
+ 
+     // Industrial — asymmetric hard-clip at high bias creates a thick stack of even
+@@ -216,6 +240,10 @@ pub const PRESETS: &[Preset] = &[
+         limiter_threshold: -0.5,
+         limiter_release: 50.0,
+         bpm: 155.0,
++        punch_level: 0.60,
++        punch_freq: 350.0,
++        punch_decay: 8.0,
++        punch_curve: 3.0,
+     },
+ 
+     // Fold Metal — sine wavefolder with ADAA. The folding carves dense metallic
+@@ -247,5 +275,9 @@ pub const PRESETS: &[Preset] = &[
+         limiter_threshold: -0.5,
+         limiter_release: 90.0,
+         bpm: 150.0,
++        punch_level: 0.40,
++        punch_freq: 260.0,
++        punch_decay: 12.0,
++        punch_curve: 2.8,
+     },
+ ];
+diff --git a/src/render.rs b/src/render.rs
+index 50270e8..deef3f7 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -19,8 +19,10 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+ 
+     // Fresh DSP state — independent of the live plugin instance.
+     let mut phase = 0.0_f32;
++    let mut punch_phase = 0.0_f32;
+     let mut pitch_env = Envelope::default();
+     let mut amp_env = Envelope::default();
++    let mut punch_env = Envelope::default();
+     let mut pre_eq = BiquadFilter::default();
+     let mut post_eq = BiquadFilter::default();
+     let mut dc_blocker = DcBlocker::default();
+@@ -46,6 +48,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+ 
+     pitch_env.trigger();
+     amp_env.trigger();
++    punch_env.trigger();
+ 
+     let shaper = params.shaper.value();
+     let drive = params.drive.value();
+@@ -64,10 +67,20 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+             let end = params.pitch_end.value();
+             let freq = start * (end / start).powf(shaped_t);
+ 
+-            let osc = (phase * std::f32::consts::TAU).sin();
++            let osc_base = (phase * std::f32::consts::TAU).sin();
+             phase = (phase + freq / SR).fract();
+ 
+-            let (sub, high) = crossover.process(osc);
++            let punch = if punch_env.is_active() {
++                let pt = punch_env.tick(params.punch_decay.value() * 0.001 * SR);
++                let env = (1.0 - pt).powf(params.punch_curve.value());
++                let s = (punch_phase * std::f32::consts::TAU).sin();
++                punch_phase = (punch_phase + params.punch_freq.value() / SR).fract();
++                s * env * params.punch_level.value()
++            } else {
++                0.0
++            };
++
++            let (sub, high) = crossover.process(osc_base + punch);
+             let pre = pre_eq.process(high);
+             let shaped = oversampler.process(pre, os, |s| wave_shaper.process(s, shaper, drive, bias));
+             let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));
+-- 
+2.43.0
+

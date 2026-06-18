@@ -1,0 +1,50 @@
+From c7a85200d91a0089453cb1bcfb4d7ca3a4018ed7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 18 Jun 2026 10:24:02 +0000
+Subject: [PATCH] Reset all DSP state on each note trigger to eliminate
+ pop/crack
+
+Filter delay lines (crossover, pre/post EQ, DC blocker, click HP) and
+ADAA waveshaper state were carrying non-zero values from the decaying
+previous note. On retrigger the fresh oscillator signal was fed into
+these stale states, causing a discontinuity spike audible as a pop.
+Resetting every DSP component inside fire() ensures a clean start on
+every hit, regardless of how early the retrigger occurs.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GwURq9bT1AzMqUHKVyWkmv
+---
+ src/lib.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index e88e3a8..c50dc94 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -103,13 +103,22 @@ impl HardKick {
+         }
+     }
+ 
+-    /// Resets the oscillator and (re)triggers all envelopes for a new kick.
++    /// Resets all DSP state and (re)triggers all envelopes for a new kick.
+     fn fire(&mut self, velocity: f32) {
+         self.velocity = velocity;
+         self.osc.reset();
+         self.pitch_env.trigger();
+         self.amp_env.trigger();
+         self.click_env.trigger();
++        // Clear filter delay lines so stale state from the previous note's tail
++        // doesn't cause a discontinuity (pop/crack) at the start of the new note.
++        self.crossover.reset();
++        self.pre_eq.reset();
++        self.dc_blocker.reset();
++        self.post_eq.reset();
++        self.click_hp.reset();
++        self.wave_shaper.reset();
++        self.oversampler.reset();
+         // Capture the onset ramp length at trigger time so a mid-note param change
+         // doesn't corrupt an in-progress ramp.
+         let attack_ms = self.params.amp_attack.value();
+-- 
+2.43.0
+

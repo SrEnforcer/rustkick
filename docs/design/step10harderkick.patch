@@ -1,0 +1,436 @@
+From f0dcda2ca510c69cb92031a3a0d825766fcefdf7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 18 Jun 2026 09:43:35 +0000
+Subject: [PATCH] Make the kick harder: triode saturator, phase locking, ADAA
+ wavefolder
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three improvements from the research document to achieve competitive hardness:
+
+1. Asymmetric triode saturator (Shaper::Tube, replaces plain tanh):
+   f(x) = (x-q)/(1-exp(-k(x-q))) + q/(1-exp(kq))
+   With bias > 0 the curve is asymmetric around the operating point q,
+   generating even harmonics alongside the odd ones. This is the difference
+   between a thin, bright hardstyle tone and a thick, aggressive rawstyle body.
+   Output bounded via tanh; numerically stable near xq=0 and q=0 via L'Hopital.
+
+2. Phase locking on trigger (osc.rs):
+   Oscillator now resets to phase = 0.25 (π/2, the sine peak) instead of 0
+   (zero-crossing). Every trigger delivers maximum amplitude on the first sample,
+   giving a consistent, punchy sub-impact regardless of retrigger timing.
+
+3. First-order ADAA on the sine wavefolder (WaveShaper struct):
+   Replaces naive hard-fold with ADAA using the closed-form antiderivative of
+   sin(x*π/2): F(x) = -(2/π)*cos(x*π/2). Output = (F(x)-F(x_prev))/(x-x_prev)
+   with midpoint fallback when consecutive samples are too close. Eliminates
+   the aliasing products that made the raw folder sound gritty at high drive.
+
+WaveShaper is now a stateful struct; lib.rs and render.rs use it instead of
+the stateless shape() function (which is kept for the editor waveform preview).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/dsp/distortion.rs | 171 ++++++++++++++++++++++++++++--------------
+ src/dsp/mod.rs        |   2 +-
+ src/dsp/osc.rs        |   6 +-
+ src/editor.rs         |   2 +-
+ src/lib.rs            |  20 +++--
+ src/params.rs         |   2 +-
+ src/presets.rs        |   6 +-
+ src/render.rs         |   5 +-
+ 8 files changed, 140 insertions(+), 74 deletions(-)
+
+diff --git a/src/dsp/distortion.rs b/src/dsp/distortion.rs
+index fbd9f6d..c3bd174 100644
+--- a/src/dsp/distortion.rs
++++ b/src/dsp/distortion.rs
+@@ -1,77 +1,138 @@
+ use nih_plug::prelude::Enum;
++use std::f32::consts::PI;
+ 
+-/// Waveshaping model that determines which kind of harmonics the distortion generates.
+-///
+-/// The choice between symmetric and asymmetric shaping is the difference between a
+-/// hollow, square hardstyle tone (odd harmonics) and a richer, more aggressive
+-/// rawstyle tone (both even and odd harmonics).
++/// Waveshaping model for the distortion stage.
+ #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Shaper {
+-    /// Symmetric soft clip (`tanh`) — odd harmonics, rounded saturation.
+-    #[name = "Soft"]
+-    Soft,
+-    /// Hard clip — sharp, square distortion with strong odd harmonics.
++    /// Asymmetric triode saturation — generates both even and odd harmonics for the
++    /// thick, aggressive rawstyle body. Unlike plain tanh (odd-only), even harmonics
++    /// add warmth and weight that cuts through a dense mix.
++    #[name = "Tube"]
++    Tube,
++    /// Hard clip — sharp brickwall distortion, strong odd harmonics only.
+     #[name = "Hard"]
+     Hard,
+-    /// Wavefolder — folds the signal back to carve metallic overtones (rawstyle).
++    /// Sine wavefolder with first-order ADAA — folds the signal back to carve
++    /// dense metallic overtones without the aliasing of naive folding.
+     #[name = "Fold"]
+     Fold,
+ }
+ 
+-/// Folds the signal back over a threshold an arbitrary number of times.
++/// Stateless shaper for the editor waveform preview.
++/// Does not run ADAA (no state available); accuracy is "good enough" for display.
++pub fn shape(x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
++    let gain = 1.0 + drive * 20.0;
++    let driven = x * gain;
++    match mode {
++        Shaper::Tube => triode(driven, drive, bias),
++        Shaper::Hard => (driven + bias * 0.9).clamp(-1.0, 1.0) - (bias * 0.9).clamp(-1.0, 1.0),
++        Shaper::Fold => (driven * PI * 0.5).sin(),
++    }
++}
++
++/// Asymmetric triode saturation model.
++///
++/// `f(x) = (x-q)/(1-exp(-k(x-q))) + q/(1-exp(k*q))`
+ ///
+-/// Unlike clipping (which caps the peak), a wavefolder mirrors the amplitude,
+-/// producing a very dense harmonic structure. Adapted from the design report
+-/// (DSP math of the hardstyle kick).
+-fn hard_fold(input: f32, threshold: f32) -> f32 {
+-    let sign = input.signum();
+-    let x = input.abs();
++/// The second term is a DC correction so f(0) = 0 exactly.
++/// With q > 0 the curve is asymmetric: positive peaks are amplified more than negative
++/// peaks, generating even harmonics alongside the odd ones that any saturator produces.
++/// The final tanh bounds the output to (-1, 1).
++///
++/// `drive` → k  (saturation intensity)
++/// `bias`  → q  (operating-point shift, 0 = symmetric)
++#[inline]
++fn triode(x: f32, drive: f32, bias: f32) -> f32 {
++    let k = 1.0 + drive * 14.0;
++    let q = bias * 0.7;
++    let xq = x - q;
+ 
+-    if x > threshold {
+-        let remainder = x % threshold;
+-        let num_folds = (x / threshold).floor() as i32;
+-        let y = if num_folds % 2 == 0 {
+-            remainder
+-        } else {
+-            threshold - remainder
+-        };
+-        y * sign
++    // Numerically stable body: L'Hopital limit as xq→0 is 1/k.
++    let body = if xq.abs() < 1e-5 {
++        1.0 / k
+     } else {
+-        input
+-    }
++        xq / (1.0 - (-k * xq).exp())
++    };
++
++    // DC correction: limit as q→0 of q/(1-exp(kq)) = -1/k.
++    let dc = if q.abs() < 1e-5 {
++        -1.0 / k
++    } else {
++        q / (1.0 - (k * q).exp())
++    };
++
++    (body + dc).tanh()
++}
++
++/// Antiderivative of the sine wavefolder f(x) = sin(x * π/2):
++/// F(x) = -(2/π) * cos(x * π/2)
++#[inline]
++fn fold_antiderivative(x: f32) -> f32 {
++    -(2.0 / PI) * (x * PI * 0.5).cos()
+ }
+ 
+-/// Shapes a single sample according to the selected model.
++/// Stateful waveshaper that applies the selected mode per sample.
+ ///
+-/// `drive` (0.0..=1.0) controls the intensity and `bias` (0.0..=1.0) introduces
+-/// asymmetry. A bias above zero shifts the operating point on the non-linear curve,
+-/// generating even harmonics for a thicker, warmer tone. The output is always
+-/// bounded to roughly [-1.0, 1.0].
+-pub fn shape(x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
+-    // Map drive to a usable input gain.
+-    let gain = 1.0 + drive * 24.0;
+-    let driven = x * gain;
++/// The Fold mode uses first-order Antiderivative Antialiasing (ADAA): instead of
++/// evaluating f(x) directly, it computes `(F(x) - F(x_prev)) / (x - x_prev)` where
++/// F is the closed-form antiderivative of the folder. This eliminates the aliasing
++/// products that would otherwise fold back from above Nyquist, giving cleaner
++/// metallic harmonics than naive folding or oversampling, at near-zero extra CPU cost.
++pub struct WaveShaper {
++    prev_x: f32,
++    prev_f: f32,
++}
+ 
+-    match mode {
+-        // Asymmetric tanh; the subtraction removes the resting DC offset that the
+-        // bias introduces (a dedicated DC blocker downstream is still desirable).
+-        Shaper::Soft => {
+-            let b = bias * 0.9;
+-            (driven + b).tanh() - b.tanh()
++impl Default for WaveShaper {
++    fn default() -> Self {
++        Self {
++            prev_x: 0.0,
++            prev_f: fold_antiderivative(0.0),
+         }
+-        // Hard clip with asymmetric thresholds: a positive bias makes the bottom
+-        // clip sooner than the top, which adds even harmonics.
+-        Shaper::Hard => (driven + bias).clamp(-1.0, 1.0) - bias.clamp(-1.0, 1.0),
+-        // Wavefolder around a fixed threshold of 1.0.
+-        Shaper::Fold => hard_fold(driven, 1.0),
+     }
+ }
+ 
+-/// First-order DC-blocking high-pass (~20 Hz) that removes the DC component
+-/// introduced by asymmetric distortion.
+-///
+-/// Without this filter a static offset would eat headroom and cause floating
+-/// sub frequencies on a PA system.
++impl WaveShaper {
++    pub fn reset(&mut self) {
++        self.prev_x = 0.0;
++        self.prev_f = fold_antiderivative(0.0);
++    }
++
++    #[inline]
++    pub fn process(&mut self, x: f32, mode: Shaper, drive: f32, bias: f32) -> f32 {
++        let gain = 1.0 + drive * 20.0;
++        let driven = x * gain;
++        let out = match mode {
++            Shaper::Tube => triode(driven, drive, bias),
++            Shaper::Hard => {
++                let b = bias * 0.9;
++                (driven + b).clamp(-1.0, 1.0) - b.clamp(-1.0, 1.0)
++            }
++            Shaper::Fold => {
++                // First-order ADAA.
++                let cur_f = fold_antiderivative(driven);
++                let dx = driven - self.prev_x;
++                let y = if dx.abs() > 1e-5 {
++                    (cur_f - self.prev_f) / dx
++                } else {
++                    // Midpoint fallback when consecutive samples are too close.
++                    ((driven + self.prev_x) * PI * 0.25).sin()
++                };
++                self.prev_x = driven;
++                self.prev_f = cur_f;
++                y
++            }
++        };
++        if mode != Shaper::Fold {
++            self.prev_x = driven;
++            self.prev_f = fold_antiderivative(driven);
++        }
++        out
++    }
++}
++
++/// First-order DC-blocking high-pass (~20 Hz).
++/// Removes the DC offset introduced by asymmetric distortion.
+ pub struct DcBlocker {
+     x1: f32,
+     y1: f32,
+@@ -84,14 +145,12 @@ impl Default for DcBlocker {
+ }
+ 
+ impl DcBlocker {
+-    /// Clears the internal state (on plugin reset).
+     pub fn reset(&mut self) {
+         self.x1 = 0.0;
+         self.y1 = 0.0;
+     }
+ 
+-    /// Processes a single sample. The coefficient `R` sets the cutoff frequency;
+-    /// 0.9995 sits around 20 Hz at 44.1 kHz.
++    #[inline]
+     pub fn process(&mut self, x: f32) -> f32 {
+         const R: f32 = 0.9995;
+         let y = x - self.x1 + R * self.y1;
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index 5445d8a..46a2749 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -6,7 +6,7 @@ pub mod noise;
+ pub mod osc;
+ pub mod oversample;
+ 
+-pub use distortion::{shape, DcBlocker, Shaper};
++pub use distortion::{shape, DcBlocker, Shaper, WaveShaper};
+ pub use envelope::Envelope;
+ pub use filter::{BiquadFilter, LRCrossover};
+ pub use limiter::Limiter;
+diff --git a/src/dsp/osc.rs b/src/dsp/osc.rs
+index f264891..a626b5c 100644
+--- a/src/dsp/osc.rs
++++ b/src/dsp/osc.rs
+@@ -13,9 +13,11 @@ impl SineOsc {
+         }
+     }
+ 
+-    /// Resets the oscillator to a zero-crossing, preventing clicks on retrigger.
++    /// Resets the oscillator phase to π/2 (peak) so the first output sample has
++    /// maximum amplitude — this is "phase locking", ensuring every trigger delivers
++    /// identical punch regardless of when in the previous cycle the retrigger fires.
+     pub fn reset(&mut self) {
+-        self.phase = 0.0;
++        self.phase = 0.25; // 0.25 cycles = π/2 radians = sin peak
+     }
+ 
+     pub fn tick(&mut self, freq: f32) -> f32 {
+diff --git a/src/editor.rs b/src/editor.rs
+index d9f57ba..17b1550 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -379,7 +379,7 @@ pub fn create(
+                             "MODE",
+                             params.shaper.value(),
+                             &[
+-                                (Shaper::Soft, "SOFT"),
++                                (Shaper::Tube, "TUBE"),
+                                 (Shaper::Hard, "HARD"),
+                                 (Shaper::Fold, "FOLD"),
+                             ],
+diff --git a/src/lib.rs b/src/lib.rs
+index 391c8a6..11a8b03 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,7 +12,8 @@ mod presets;
+ mod render;
+ 
+ use dsp::{
+-    shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
++    BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
++    WaveShaper,
+ };
+ use params::HardKickParams;
+ 
+@@ -43,6 +44,7 @@ pub struct HardKick {
+     crossover: LRCrossover,
+     limiter: Limiter,
+     oversampler: Oversampler,
++    wave_shaper: WaveShaper,
+ }
+ 
+ impl Default for HardKick {
+@@ -71,6 +73,7 @@ impl Default for HardKick {
+             crossover: LRCrossover::default(),
+             limiter: Limiter::default(),
+             oversampler: Oversampler::default(),
++            wave_shaper: WaveShaper::default(),
+         }
+     }
+ }
+@@ -161,6 +164,7 @@ impl Plugin for HardKick {
+         self.crossover.reset();
+         self.limiter.reset();
+         self.oversampler.reset();
++        self.wave_shaper.reset();
+     }
+ 
+     fn process(
+@@ -252,16 +256,16 @@ impl Plugin for HardKick {
+                 let osc = self.osc.tick(freq);
+                 let (sub, high) = self.crossover.process(osc);
+                 let pre = self.pre_eq.process(high);
+-                // Oversample only the nonlinearity — it is the sole source of
+-                // aliasing in the chain. Pre/post EQ are linear and stay at base rate.
+                 let shaper = self.params.shaper.value();
+                 let drive = self.params.drive.value();
+                 let bias = self.params.bias.value();
+-                let shaped = self
+-                    .oversampler
+-                    .process(pre, self.params.oversample.value(), |s| {
+-                        shape(s, shaper, drive, bias)
+-                    });
++                // Fold mode uses ADAA inside WaveShaper (no oversampling needed there).
++                // Tube and Hard still benefit from oversampling at extreme drive settings.
++                let shaped = self.oversampler.process(
++                    pre,
++                    self.params.oversample.value(),
++                    |s| self.wave_shaper.process(s, shaper, drive, bias),
++                );
+                 let mix = self.params.dist_mix.value();
+                 let driven = self
+                     .post_eq
+diff --git a/src/params.rs b/src/params.rs
+index 58ac7ff..83fbc8b 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -171,7 +171,7 @@ impl Default for HardKickParams {
+ 
+             // Default Soft + drive 0.0 keeps the step-1 tone (clean sine) intact;
+             // the user dials in the hardness deliberately.
+-            shaper: EnumParam::new("Shaper", Shaper::Soft),
++            shaper: EnumParam::new("Shaper", Shaper::Tube),
+ 
+             drive: FloatParam::new("Drive", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
+diff --git a/src/presets.rs b/src/presets.rs
+index fe4d3d6..03b4cb5 100644
+--- a/src/presets.rs
++++ b/src/presets.rs
+@@ -83,7 +83,7 @@ pub const PRESETS: &[Preset] = &[
+         amp_decay: 0.6,
+         amp_curve: 1.2,
+         level: 0.85,
+-        shaper: Shaper::Soft,
++        shaper: Shaper::Tube,
+         drive: 0.35,
+         bias: 0.0,
+         dist_mix: 1.0,
+@@ -172,7 +172,7 @@ pub const PRESETS: &[Preset] = &[
+         amp_decay: 0.80,
+         amp_curve: 1.0,
+         level: 0.88,
+-        shaper: Shaper::Soft,
++        shaper: Shaper::Tube,
+         drive: 0.20,
+         bias: 0.0,
+         dist_mix: 0.6,
+@@ -231,7 +231,7 @@ pub const PRESETS: &[Preset] = &[
+         amp_decay: 1.10,
+         amp_curve: 0.8,
+         level: 0.75,
+-        shaper: Shaper::Soft,
++        shaper: Shaper::Tube,
+         drive: 0.15,
+         bias: 0.0,
+         dist_mix: 0.5,
+diff --git a/src/render.rs b/src/render.rs
+index 758a440..50270e8 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1,4 +1,4 @@
+-use crate::dsp::{shape, BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler};
++use crate::dsp::{BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler, WaveShaper};
+ use crate::params::HardKickParams;
+ 
+ const SR: f32 = 44_100.0;
+@@ -27,6 +27,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+     let mut crossover = LRCrossover::default();
+     let mut oversampler = Oversampler::default();
+     let mut limiter = Limiter::default();
++    let mut wave_shaper = WaveShaper::default();
+ 
+     // Recompute coefficients (same logic as lib.rs process()).
+     pre_eq.set_peaking(
+@@ -68,7 +69,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+ 
+             let (sub, high) = crossover.process(osc);
+             let pre = pre_eq.process(high);
+-            let shaped = oversampler.process(pre, os, |s| shape(s, shaper, drive, bias));
++            let shaped = oversampler.process(pre, os, |s| wave_shaper.process(s, shaper, drive, bias));
+             let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));
+             let body = sub + driven;
+ 
+-- 
+2.43.0
+

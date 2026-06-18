@@ -1,0 +1,462 @@
+From 2c6e58a75063622fb1e676cd08c7f04bbf4cfb95 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 18 Jun 2026 21:21:55 +0000
+Subject: [PATCH] Phase 3: Body compressor for density and pumping character
+
+Adds a feed-forward peak compressor operating in the log domain on the
+gain-reduction value, with exponentially smoothed attack/release. Inserted
+on the distorted high band after post-EQ but before mixing back with the
+clean sub, so the sub keeps its natural dynamics while the body gets the
+"glued" pumping character commercial kicks rely on for perceived loudness.
+
+Params:
+- comp_threshold (-40..0 dB, default -6)
+- comp_ratio (1..20, default 1.0 = bypass)
+- comp_attack (0.1..50 ms, default 3)
+- comp_release (5..500 ms, default 80)
+- comp_makeup (0..18 dB, default 0)
+
+All six presets tuned with characteristic compression: Sub Pressure gentle
+2:1 with 10ms attack to preserve dynamics; Industrial brutal 10:1 with 1.5ms
+attack and 50ms release for hard pumping; others land in between. UI grew
+a COMP panel in row 3 next to PUNCH. Render path mirrors the same chain.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GwURq9bT1AzMqUHKVyWkmv
+---
+ src/dsp/compressor.rs | 72 +++++++++++++++++++++++++++++++++++++++++
+ src/dsp/mod.rs        |  2 ++
+ src/editor.rs         |  9 ++++++
+ src/lib.rs            | 20 ++++++++++--
+ src/params.rs         | 75 +++++++++++++++++++++++++++++++++++++++++++
+ src/presets.rs        | 40 +++++++++++++++++++++++
+ src/render.rs         | 14 +++++++-
+ 7 files changed, 229 insertions(+), 3 deletions(-)
+ create mode 100644 src/dsp/compressor.rs
+
+diff --git a/src/dsp/compressor.rs b/src/dsp/compressor.rs
+new file mode 100644
+index 0000000..adc32d6
+--- /dev/null
++++ b/src/dsp/compressor.rs
+@@ -0,0 +1,72 @@
++/// Feed-forward peak compressor operating in the log (dB) domain on the
++/// gain-reduction value. Smoothed exponentially with separate attack/release
++/// time constants.
++///
++/// Used as a body shaper *after* the waveshaper and post-EQ: squeezes the
++/// distorted high band into a denser, more "glued" body — the pumping
++/// character commercial kicks rely on for perceived loudness.
++pub struct Compressor {
++    /// Current smoothed gain reduction in dB (≥ 0).
++    reduction_db: f32,
++    attack_coeff: f32,
++    release_coeff: f32,
++    threshold_db: f32,
++    ratio: f32,
++    makeup_lin: f32,
++}
++
++impl Default for Compressor {
++    fn default() -> Self {
++        Self {
++            reduction_db: 0.0,
++            attack_coeff: 0.0,
++            release_coeff: 0.0,
++            threshold_db: 0.0,
++            ratio: 1.0,
++            makeup_lin: 1.0,
++        }
++    }
++}
++
++impl Compressor {
++    pub fn reset(&mut self) {
++        self.reduction_db = 0.0;
++    }
++
++    /// Recompute coefficients. Call once per buffer.
++    pub fn set_params(
++        &mut self,
++        threshold_db: f32,
++        ratio: f32,
++        attack_ms: f32,
++        release_ms: f32,
++        makeup_db: f32,
++        sample_rate: f32,
++    ) {
++        self.threshold_db = threshold_db;
++        self.ratio = ratio.max(1.0);
++        self.attack_coeff = (-1.0 / (attack_ms.max(0.01) * 0.001 * sample_rate)).exp();
++        self.release_coeff = (-1.0 / (release_ms.max(0.01) * 0.001 * sample_rate)).exp();
++        self.makeup_lin = 10.0_f32.powf(makeup_db / 20.0);
++    }
++
++    #[inline]
++    pub fn process(&mut self, x: f32) -> f32 {
++        let abs = x.abs().max(1e-9);
++        let x_db = 20.0 * abs.log10();
++        let over = x_db - self.threshold_db;
++        let target = if over > 0.0 {
++            over * (1.0 - 1.0 / self.ratio)
++        } else {
++            0.0
++        };
++        let coeff = if target > self.reduction_db {
++            self.attack_coeff
++        } else {
++            self.release_coeff
++        };
++        self.reduction_db = target + (self.reduction_db - target) * coeff;
++        let gain = 10.0_f32.powf(-self.reduction_db / 20.0);
++        x * gain * self.makeup_lin
++    }
++}
+diff --git a/src/dsp/mod.rs b/src/dsp/mod.rs
+index 46a2749..5dcc222 100644
+--- a/src/dsp/mod.rs
++++ b/src/dsp/mod.rs
+@@ -1,3 +1,4 @@
++pub mod compressor;
+ pub mod distortion;
+ pub mod envelope;
+ pub mod filter;
+@@ -6,6 +7,7 @@ pub mod noise;
+ pub mod osc;
+ pub mod oversample;
+ 
++pub use compressor::Compressor;
+ pub use distortion::{shape, DcBlocker, Shaper, WaveShaper};
+ pub use envelope::Envelope;
+ pub use filter::{BiquadFilter, LRCrossover};
+diff --git a/src/editor.rs b/src/editor.rs
+index 53c50dc..ad03a3d 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -620,6 +620,15 @@ pub fn create(
+                             knob(ui, "Curve", &params.punch_curve, setter);
+                         });
+ 
++                        // COMP — body compressor on the distorted high band.
++                        panel(ui, "COMP  [body]", |ui| {
++                            knob(ui, "Thr", &params.comp_threshold, setter);
++                            knob(ui, "Ratio", &params.comp_ratio, setter);
++                            knob(ui, "Atk", &params.comp_attack, setter);
++                            knob(ui, "Rel", &params.comp_release, setter);
++                            knob(ui, "Makeup", &params.comp_makeup, setter);
++                        });
++
+                         // SEQ — standalone audition BPM.
+                         panel(ui, "SEQ", |ui| {
+                             knob(ui, "BPM", &params.bpm, setter);
+diff --git a/src/lib.rs b/src/lib.rs
+index 33462ae..257dae3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,8 +12,8 @@ mod presets;
+ mod render;
+ 
+ use dsp::{
+-    BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler, SineOsc,
+-    WaveShaper,
++    BiquadFilter, Compressor, DcBlocker, Envelope, LRCrossover, Limiter, Noise, Oversampler,
++    SineOsc, WaveShaper,
+ };
+ use params::HardKickParams;
+ 
+@@ -47,6 +47,7 @@ pub struct HardKick {
+     limiter: Limiter,
+     oversampler: Oversampler,
+     wave_shaper: WaveShaper,
++    body_comp: Compressor,
+     // Onset ramp — fades in amplitude over `onset_total` samples on each trigger,
+     // preventing the click caused by an instantaneous jump from silence to full gain.
+     onset_pos: u32,
+@@ -82,6 +83,7 @@ impl Default for HardKick {
+             limiter: Limiter::default(),
+             oversampler: Oversampler::default(),
+             wave_shaper: WaveShaper::default(),
++            body_comp: Compressor::default(),
+             onset_pos: 0,
+             onset_total: 0,
+         }
+@@ -125,6 +127,7 @@ impl HardKick {
+         self.click_hp.reset();
+         self.wave_shaper.reset();
+         self.oversampler.reset();
++        self.body_comp.reset();
+         // Capture the onset ramp length at trigger time so a mid-note param change
+         // doesn't corrupt an in-progress ramp.
+         let attack_ms = self.params.amp_attack.value();
+@@ -193,6 +196,7 @@ impl Plugin for HardKick {
+         self.limiter.reset();
+         self.oversampler.reset();
+         self.wave_shaper.reset();
++        self.body_comp.reset();
+         self.onset_pos = 0;
+         self.onset_total = 0;
+     }
+@@ -227,6 +231,14 @@ impl Plugin for HardKick {
+             self.params.limiter_release.value(),
+             self.sample_rate,
+         );
++        self.body_comp.set_params(
++            self.params.comp_threshold.value(),
++            self.params.comp_ratio.value(),
++            self.params.comp_attack.value(),
++            self.params.comp_release.value(),
++            self.params.comp_makeup.value(),
++            self.sample_rate,
++        );
+ 
+         if !playing {
+             self.beat_phase = 0.0;
+@@ -314,6 +326,10 @@ impl Plugin for HardKick {
+                 let driven = self
+                     .post_eq
+                     .process(self.dc_blocker.process(lerp(pre, shaped, mix)));
++                // Body compressor — squeezes the distorted high band into a
++                // denser, more "glued" sound. Sub band stays uncompressed to
++                // keep the low end's natural dynamics.
++                let driven = self.body_comp.process(driven);
+                 let body = sub + driven;
+ 
+                 let amp_t = self
+diff --git a/src/params.rs b/src/params.rs
+index d1fc228..e096fda 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -130,6 +130,27 @@ pub struct HardKickParams {
+     /// Punch layer amplitude curve exponent — shapes how the burst fades.
+     #[id = "punch_curve"]
+     pub punch_curve: FloatParam,
++
++    /// Body compressor threshold in dB. Levels above this get squeezed
++    /// according to the ratio.
++    #[id = "comp_threshold"]
++    pub comp_threshold: FloatParam,
++
++    /// Body compressor ratio (1.0 = bypass). Higher = harder squeeze.
++    #[id = "comp_ratio"]
++    pub comp_ratio: FloatParam,
++
++    /// Body compressor attack time in milliseconds — how fast it clamps onsets.
++    #[id = "comp_attack"]
++    pub comp_attack: FloatParam,
++
++    /// Body compressor release time in milliseconds — pumping speed.
++    #[id = "comp_release"]
++    pub comp_release: FloatParam,
++
++    /// Body compressor make-up gain in dB to compensate for level loss.
++    #[id = "comp_makeup"]
++    pub comp_makeup: FloatParam,
+ }
+ 
+ impl Default for HardKickParams {
+@@ -383,6 +404,60 @@ impl Default for HardKickParams {
+                 FloatRange::Linear { min: 0.1, max: 8.0 },
+             )
+             .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            // Default threshold -6 dB / ratio 1.0 — compressor is effectively
++            // bypassed until the user dials it in.
++            comp_threshold: FloatParam::new(
++                "Comp threshold",
++                -6.0,
++                FloatRange::Linear { min: -40.0, max: 0.0 },
++            )
++            .with_unit(" dB")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
++            comp_ratio: FloatParam::new(
++                "Comp ratio",
++                1.0,
++                FloatRange::Skewed {
++                    min: 1.0,
++                    max: 20.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(":1")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
++            comp_attack: FloatParam::new(
++                "Comp attack",
++                3.0,
++                FloatRange::Skewed {
++                    min: 0.1,
++                    max: 50.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" ms")
++            .with_value_to_string(formatters::v2s_f32_rounded(2)),
++
++            comp_release: FloatParam::new(
++                "Comp release",
++                80.0,
++                FloatRange::Skewed {
++                    min: 5.0,
++                    max: 500.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" ms")
++            .with_value_to_string(formatters::v2s_f32_rounded(0)),
++
++            comp_makeup: FloatParam::new(
++                "Comp makeup",
++                0.0,
++                FloatRange::Linear { min: 0.0, max: 18.0 },
++            )
++            .with_unit(" dB")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+         }
+     }
+ }
+diff --git a/src/presets.rs b/src/presets.rs
+index 959899b..6b4f238 100644
+--- a/src/presets.rs
++++ b/src/presets.rs
+@@ -32,6 +32,11 @@ pub struct Preset {
+     pub punch_freq: f32,
+     pub punch_decay: f32,
+     pub punch_curve: f32,
++    pub comp_threshold: f32,
++    pub comp_ratio: f32,
++    pub comp_attack: f32,
++    pub comp_release: f32,
++    pub comp_makeup: f32,
+ }
+ 
+ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+@@ -70,6 +75,11 @@ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+     set!(params.punch_freq, preset.punch_freq);
+     set!(params.punch_decay, preset.punch_decay);
+     set!(params.punch_curve, preset.punch_curve);
++    set!(params.comp_threshold, preset.comp_threshold);
++    set!(params.comp_ratio, preset.comp_ratio);
++    set!(params.comp_attack, preset.comp_attack);
++    set!(params.comp_release, preset.comp_release);
++    set!(params.comp_makeup, preset.comp_makeup);
+ }
+ 
+ pub const PRESETS: &[Preset] = &[
+@@ -105,6 +115,11 @@ pub const PRESETS: &[Preset] = &[
+         punch_freq: 220.0,
+         punch_decay: 14.0,
+         punch_curve: 2.5,
++        comp_threshold: -10.0,
++        comp_ratio: 4.0,
++        comp_attack: 5.0,
++        comp_release: 80.0,
++        comp_makeup: 4.0,
+     },
+ 
+     // Raw Screech — narrow pre-EQ peak boosted into the tube saturator generates
+@@ -140,6 +155,11 @@ pub const PRESETS: &[Preset] = &[
+         punch_freq: 280.0,
+         punch_decay: 10.0,
+         punch_curve: 3.0,
++        comp_threshold: -14.0,
++        comp_ratio: 6.0,
++        comp_attack: 2.0,
++        comp_release: 60.0,
++        comp_makeup: 6.0,
+     },
+ 
+     // Minimal Tek — short, punchy, hard-clipped. Almost all attack, minimal tail.
+@@ -174,6 +194,11 @@ pub const PRESETS: &[Preset] = &[
+         punch_freq: 320.0,
+         punch_decay: 6.0,
+         punch_curve: 3.5,
++        comp_threshold: -12.0,
++        comp_ratio: 8.0,
++        comp_attack: 1.0,
++        comp_release: 40.0,
++        comp_makeup: 5.0,
+     },
+ 
+     // Sub Pressure — maximum low-end weight. Crossover at 80 Hz keeps almost the
+@@ -209,6 +234,11 @@ pub const PRESETS: &[Preset] = &[
+         punch_freq: 180.0,
+         punch_decay: 20.0,
+         punch_curve: 2.0,
++        comp_threshold: -6.0,
++        comp_ratio: 2.0,
++        comp_attack: 10.0,
++        comp_release: 150.0,
++        comp_makeup: 2.0,
+     },
+ 
+     // Industrial — asymmetric hard-clip at high bias creates a thick stack of even
+@@ -244,6 +274,11 @@ pub const PRESETS: &[Preset] = &[
+         punch_freq: 350.0,
+         punch_decay: 8.0,
+         punch_curve: 3.0,
++        comp_threshold: -16.0,
++        comp_ratio: 10.0,
++        comp_attack: 1.5,
++        comp_release: 50.0,
++        comp_makeup: 7.0,
+     },
+ 
+     // Fold Metal — sine wavefolder with ADAA. The folding carves dense metallic
+@@ -279,5 +314,10 @@ pub const PRESETS: &[Preset] = &[
+         punch_freq: 260.0,
+         punch_decay: 12.0,
+         punch_curve: 2.8,
++        comp_threshold: -12.0,
++        comp_ratio: 6.0,
++        comp_attack: 3.0,
++        comp_release: 70.0,
++        comp_makeup: 5.0,
+     },
+ ];
+diff --git a/src/render.rs b/src/render.rs
+index deef3f7..4ac4656 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1,4 +1,6 @@
+-use crate::dsp::{BiquadFilter, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler, WaveShaper};
++use crate::dsp::{
++    BiquadFilter, Compressor, DcBlocker, Envelope, LRCrossover, Limiter, Oversampler, WaveShaper,
++};
+ use crate::params::HardKickParams;
+ 
+ const SR: f32 = 44_100.0;
+@@ -30,6 +32,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+     let mut oversampler = Oversampler::default();
+     let mut limiter = Limiter::default();
+     let mut wave_shaper = WaveShaper::default();
++    let mut body_comp = Compressor::default();
+ 
+     // Recompute coefficients (same logic as lib.rs process()).
+     pre_eq.set_peaking(
+@@ -45,6 +48,14 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+         params.limiter_release.value(),
+         SR,
+     );
++    body_comp.set_params(
++        params.comp_threshold.value(),
++        params.comp_ratio.value(),
++        params.comp_attack.value(),
++        params.comp_release.value(),
++        params.comp_makeup.value(),
++        SR,
++    );
+ 
+     pitch_env.trigger();
+     amp_env.trigger();
+@@ -84,6 +95,7 @@ pub fn export_wav(params: &HardKickParams, path: &str) -> Result<(), String> {
+             let pre = pre_eq.process(high);
+             let shaped = oversampler.process(pre, os, |s| wave_shaper.process(s, shaper, drive, bias));
+             let driven = post_eq.process(dc_blocker.process(lerp(pre, shaped, mix)));
++            let driven = body_comp.process(driven);
+             let body = sub + driven;
+ 
+             let amp_t = amp_env.tick(params.amp_decay.value() * SR);
+-- 
+2.43.0
+

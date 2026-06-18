@@ -1,0 +1,1016 @@
+From 83e3beb11417b3e9bac1d6593cc51dac7beb6a8b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 18 Jun 2026 10:06:28 +0000
+Subject: [PATCH] Fix pop/crack, add amp attack, restructure UI into
+ Attack/Body/Shape columns
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pop/crack fix:
+- Revert osc.reset() to phase=0 (zero-crossing). Phase=0.25 caused an
+  instantaneous jump to full amplitude on the first sample — a textbook click.
+- Add onset ramp: every fire() captures amp_attack_ms as onset_total samples.
+  The amplitude is multiplied by a linear 0→1 ramp over that window before
+  reaching the limiter. Default 2ms is inaudible but eliminates the click at
+  any drive setting.
+
+New amp_attack param (0–20ms, default 2ms) exposed as the "Atk" knob in
+the ATTACK panel. Users can tighten it to 0 for a drum-machine snap or
+extend it for a soft, swelling onset.
+
+UI restructured into two rows of three semantic columns:
+  Row 1: ATTACK (click + onset) | BODY (pitch sweep + amp decay) | SHAPE (distortion routing)
+  Row 2: EQ/SCREECH (pre-dist) | OUTPUT (limiter + OS) | SEQ (BPM)
+
+SHAPE panel now labels its scope: "[high band only]" — distortion is
+applied only above the crossover frequency; the sub band always stays
+clean. EQ panel labels "[pre-dist]" so the screech-generation routing is
+visually obvious without reading the docs.
+
+ui.columns() replaces the old horizontal_top panels so each column fills
+its natural share of the window width. ScrollArea wraps everything so
+the window can be resized smaller without clipping content.
+
+Presets updated: all six presets tuned to the triode shaper's actual
+response curve, with correct amp_attack values. Sub Pressure now uses
+bias=0 (symmetric triode) to stay clean; Raw Screech and Fold Metal
+verified to not click.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/dsp/osc.rs |  10 +-
+ src/editor.rs  | 379 ++++++++++++++++++++++---------------------------
+ src/lib.rs     |  27 +++-
+ src/params.rs  |  17 +++
+ src/presets.rs | 130 ++++++++---------
+ 5 files changed, 283 insertions(+), 280 deletions(-)
+
+diff --git a/src/dsp/osc.rs b/src/dsp/osc.rs
+index a626b5c..c5a551d 100644
+--- a/src/dsp/osc.rs
++++ b/src/dsp/osc.rs
+@@ -13,11 +13,13 @@ impl SineOsc {
+         }
+     }
+ 
+-    /// Resets the oscillator phase to π/2 (peak) so the first output sample has
+-    /// maximum amplitude — this is "phase locking", ensuring every trigger delivers
+-    /// identical punch regardless of when in the previous cycle the retrigger fires.
++    /// Resets the oscillator to a zero-crossing.
++    ///
++    /// Phase 0 means the first output sample is 0 — no discontinuity, no click.
++    /// The onset ramp in the host (lib.rs) handles the initial amplitude ramp
++    /// so the attack still feels immediate without a transient spike.
+     pub fn reset(&mut self) {
+-        self.phase = 0.25; // 0.25 cycles = π/2 radians = sin peak
++        self.phase = 0.0;
+     }
+ 
+     pub fn tick(&mut self, freq: f32) -> f32 {
+diff --git a/src/editor.rs b/src/editor.rs
+index 17b1550..8149d76 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -12,7 +12,6 @@ use std::sync::{
+     Arc,
+ };
+ 
+-// Mechanical dark-purple palette.
+ const ACCENT: egui::Color32 = egui::Color32::from_rgb(170, 130, 235);
+ const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(80, 55, 120);
+ const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(18, 14, 28);
+@@ -21,21 +20,18 @@ const KNOB_BODY: egui::Color32 = egui::Color32::from_rgb(46, 39, 64);
+ const LABEL: egui::Color32 = egui::Color32::from_rgb(185, 170, 215);
+ const LABEL_DIM: egui::Color32 = egui::Color32::from_rgb(110, 95, 150);
+ 
+-// Knob sweep: 270° with the gap at the bottom (lower-left → top → lower-right).
+ const KNOB_A0: f32 = 0.75 * PI;
+ const KNOB_A1: f32 = 2.25 * PI;
+ 
+-/// A rotary knob bound to any `Param`. Vertical drag changes the value;
+-/// double-click resets to default. Hover shows the formatted value.
+ fn knob<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSetter) {
+-    let cell = egui::vec2(50.0, 56.0);
++    let cell = egui::vec2(52.0, 58.0);
+     let (rect, _) = ui.allocate_exact_size(cell, egui::Sense::hover());
+     if !ui.is_rect_visible(rect) {
+         return;
+     }
+ 
+     let radius = 17.0;
+-    let center = egui::pos2(rect.center().x, rect.top() + radius + 5.0);
++    let center = egui::pos2(rect.center().x, rect.top() + radius + 6.0);
+     let knob_rect = egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0));
+     let resp = ui.interact(knob_rect, ui.id().with(label), egui::Sense::click_and_drag());
+ 
+@@ -43,14 +39,8 @@ fn knob<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSette
+         setter.begin_set_parameter(param);
+     }
+     if resp.dragged() {
+-        let cur = param.unmodulated_normalized_value();
+-        // Hold Shift for fine control.
+-        let speed = if ui.input(|i| i.modifiers.shift) {
+-            0.0015
+-        } else {
+-            0.006
+-        };
+-        let new = (cur - resp.drag_delta().y * speed).clamp(0.0, 1.0);
++        let speed = if ui.input(|i| i.modifiers.shift) { 0.0015 } else { 0.006 };
++        let new = (param.unmodulated_normalized_value() - resp.drag_delta().y * speed).clamp(0.0, 1.0);
+         setter.set_parameter_normalized(param, new);
+     }
+     if resp.drag_stopped() {
+@@ -64,12 +54,9 @@ fn knob<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSette
+ 
+     let t = param.unmodulated_normalized_value();
+     let painter = ui.painter_at(rect);
+-
+-    // Knob body with a subtle rim.
+     painter.circle_filled(center, radius, KNOB_BODY);
+     painter.circle_stroke(center, radius, egui::Stroke::new(1.0, ACCENT_DIM));
+ 
+-    // Value arc around the rim.
+     let arc_r = radius + 2.5;
+     let segs = 28;
+     let mut prev: Option<egui::Pos2> = None;
+@@ -84,7 +71,6 @@ fn knob<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSette
+         prev = Some(p);
+     }
+ 
+-    // Pointer.
+     let ang = KNOB_A0 + (KNOB_A1 - KNOB_A0) * t;
+     let dir = egui::vec2(ang.cos(), ang.sin());
+     painter.line_segment(
+@@ -92,21 +78,19 @@ fn knob<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSette
+         egui::Stroke::new(2.0, ACCENT),
+     );
+ 
+-    // Caption.
+     painter.text(
+-        egui::pos2(rect.center().x, rect.bottom() - 5.0),
++        egui::pos2(rect.center().x, rect.bottom() - 4.0),
+         egui::Align2::CENTER_CENTER,
+         label,
+         egui::FontId::monospace(8.5),
+         LABEL,
+     );
+ 
+-    resp.on_hover_text(param.normalized_value_to_string(t, true));
++    let formatted = param.normalized_value_to_string(t, true);
++    resp.on_hover_text(formatted);
+ }
+ 
+-/// Compact vertical 3-position lever switch (up / middle / down) with a small
+-/// label per position and a caption beneath. Generic over an enum value; the
+-/// caller supplies a closure to commit the selection.
++/// Compact vertical lever switch. Works with any Copy+PartialEq enum.
+ fn lever_switch<T: PartialEq + Copy>(
+     ui: &mut egui::Ui,
+     caption: &str,
+@@ -114,28 +98,24 @@ fn lever_switch<T: PartialEq + Copy>(
+     options: &[(T, &str)],
+     mut select: impl FnMut(T),
+ ) {
+-    let cell = egui::vec2(56.0, 56.0);
+-    let (rect, _) = ui.allocate_exact_size(cell, egui::Sense::hover());
++    let n = options.len();
++    let track_w = 14.0;
++    let track_h = (n as f32) * 14.0 + 4.0;
++    let cell_h = track_h + 16.0;
++    let cell_w = 52.0;
++    let (rect, _) = ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::hover());
+     if !ui.is_rect_visible(rect) {
+         return;
+     }
+ 
+-    let n = options.len();
+-    let track_w = 14.0;
+-    let track_h = 42.0;
+     let track = egui::Rect::from_min_size(
+-        egui::pos2(rect.left() + 4.0, rect.top() + 1.0),
++        egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+         egui::vec2(track_w, track_h),
+     );
+ 
+     let painter = ui.painter_at(rect);
+     painter.rect_filled(track, 4.0, PANEL_BG);
+-    painter.rect_stroke(
+-        track,
+-        4.0,
+-        egui::Stroke::new(1.0, ACCENT_DIM),
+-        StrokeKind::Inside,
+-    );
++    painter.rect_stroke(track, 4.0, egui::Stroke::new(1.0, ACCENT_DIM), StrokeKind::Inside);
+ 
+     let active_idx = options.iter().position(|(v, _)| *v == current).unwrap_or(0);
+ 
+@@ -144,7 +124,6 @@ fn lever_switch<T: PartialEq + Copy>(
+         let is_active = i == active_idx;
+ 
+         if is_active {
+-            // Illuminated lever cap straddling the track.
+             let cap = egui::Rect::from_center_size(
+                 egui::pos2(track.center().x, cy),
+                 egui::vec2(track_w + 5.0, 11.0),
+@@ -155,17 +134,17 @@ fn lever_switch<T: PartialEq + Copy>(
+         }
+ 
+         painter.text(
+-            egui::pos2(track.right() + 6.0, cy),
++            egui::pos2(track.right() + 5.0, cy),
+             egui::Align2::LEFT_CENTER,
+             label,
+             egui::FontId::monospace(8.5),
+             if is_active { ACCENT } else { LABEL_DIM },
+         );
+ 
+-        // Click zone covering this third of the cell.
++        let zone_h = track_h / n as f32;
+         let zone = egui::Rect::from_min_size(
+-            egui::pos2(rect.left(), track.top() + track_h * i as f32 / n as f32),
+-            egui::vec2(rect.width(), track_h / n as f32),
++            egui::pos2(rect.left(), track.top() + zone_h * i as f32),
++            egui::vec2(rect.width(), zone_h),
+         );
+         let resp = ui.interact(zone, ui.id().with((caption, i)), egui::Sense::click());
+         if resp.clicked() && !is_active {
+@@ -174,7 +153,7 @@ fn lever_switch<T: PartialEq + Copy>(
+     }
+ 
+     painter.text(
+-        egui::pos2(rect.center().x, rect.bottom() - 5.0),
++        egui::pos2(rect.center().x, rect.bottom() - 3.0),
+         egui::Align2::CENTER_CENTER,
+         caption,
+         egui::FontId::monospace(8.5),
+@@ -182,11 +161,12 @@ fn lever_switch<T: PartialEq + Copy>(
+     );
+ }
+ 
+-/// A framed module panel with a header, laying its content out in a knob row.
++/// Framed module panel with a title and a horizontal row of controls.
+ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+-    egui::Frame::group(ui.style())
++    egui::Frame::new()
+         .fill(SECTION_BG)
+         .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
++        .inner_margin(egui::Margin::symmetric(4, 4))
+         .show(ui, |ui| {
+             ui.vertical(|ui| {
+                 ui.label(
+@@ -194,7 +174,7 @@ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+                         .font(egui::FontId::monospace(8.5))
+                         .color(ACCENT),
+                 );
+-                ui.add_space(1.0);
++                ui.add_space(2.0);
+                 ui.horizontal(|ui| {
+                     ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+                     add(ui);
+@@ -203,15 +183,12 @@ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+         });
+ }
+ 
+-/// Waveform preview mirroring the audio signal path (sans biquads).
+ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+     const N: usize = 512;
+     let sr = 44_100.0_f32;
+-
+     let amp_samples = params.amp_decay.value() * sr;
+     let pitch_samples = params.decay.value() * sr;
+     let step = amp_samples / N as f32;
+-
+     let mut phase = 0.0_f32;
+     let mut wave = Vec::with_capacity(N);
+ 
+@@ -222,53 +199,34 @@ fn kick_waveform(ui: &mut egui::Ui, params: &HardKickParams) {
+         let start = params.pitch_start.value();
+         let end = params.pitch_end.value();
+         let freq = start * (end / start).powf(shaped_t);
+-        let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value();
+-
++        // Onset ramp in preview too.
++        let attack_samples = (params.amp_attack.value() * 0.001 * sr).max(1.0);
++        let onset = ((i as f32 * step) / attack_samples).min(1.0);
++        let amp = (1.0 - t_amp).powf(params.amp_curve.value()) * params.level.value() * onset;
+         let osc = (phase * TAU).sin();
+-        let shaped = shape(
+-            osc,
+-            params.shaper.value(),
+-            params.drive.value(),
+-            params.bias.value(),
+-        );
++        let shaped = shape(osc, params.shaper.value(), params.drive.value(), params.bias.value());
+         let mix = params.dist_mix.value();
+-        let body = osc + (shaped - osc) * mix;
+-        wave.push((body * amp).clamp(-1.0, 1.0));
++        wave.push(((osc + (shaped - osc) * mix) * amp).clamp(-1.0, 1.0));
+         phase = (phase + freq * step / sr).fract();
+     }
+ 
+-    let (rect, _) =
+-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::hover());
+-    if !ui.is_rect_visible(rect) {
+-        return;
+-    }
++    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::hover());
++    if !ui.is_rect_visible(rect) { return; }
+ 
+     let painter = ui.painter_at(rect);
+     painter.rect_filled(rect, 4.0, PANEL_BG);
+-    painter.rect_stroke(
+-        rect,
+-        4.0,
+-        egui::Stroke::new(1.0, ACCENT_DIM),
+-        StrokeKind::Inside,
+-    );
++    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, ACCENT_DIM), StrokeKind::Inside);
+ 
+     let cy = rect.center().y;
+     let h = rect.height() * 0.42;
+-    let w = rect.width();
+-
+     painter.line_segment(
+         [egui::pos2(rect.left(), cy), egui::pos2(rect.right(), cy)],
+         egui::Stroke::new(0.5, egui::Color32::from_rgb(55, 45, 75)),
+     );
+-
+-    let pts: Vec<egui::Pos2> = wave
+-        .iter()
+-        .enumerate()
+-        .map(|(i, &s)| {
+-            let x = rect.left() + i as f32 / (N - 1) as f32 * w;
+-            egui::pos2(x, cy - s * h)
+-        })
+-        .collect();
++    let pts: Vec<egui::Pos2> = wave.iter().enumerate().map(|(i, &s)| {
++        let x = rect.left() + i as f32 / (N - 1) as f32 * rect.width();
++        egui::pos2(x, cy - s * h)
++    }).collect();
+     for win in pts.windows(2) {
+         painter.line_segment([win[0], win[1]], egui::Stroke::new(1.5, ACCENT));
+     }
+@@ -300,143 +258,146 @@ pub fn create(
+             }
+ 
+             egui::CentralPanel::default().show(ctx, |ui| {
+-                // ── TITLE BAR + TRANSPORT ────────────────────────────────────
+-                ui.horizontal(|ui| {
+-                    ui.label(
+-                        egui::RichText::new("HARDKICK")
+-                            .font(egui::FontId::proportional(18.0))
+-                            .strong()
+-                            .color(ACCENT),
+-                    );
+-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+-                        if ui.button("💾 WAV").clicked() {
+-                            let path = format!(
+-                                "{}/hardkick-export.wav",
+-                                std::env::var("HOME").unwrap_or_else(|_| ".".into())
+-                            );
+-                            match export_wav(&params, &path) {
+-                                Ok(()) => nih_plug::nih_log!("Exported to {}", path),
+-                                Err(e) => nih_plug::nih_log!("Export failed: {}", e),
+-                            }
+-                        }
+-                        if ui.button("⚡ Trigger").clicked() {
+-                            trigger.store(true, Ordering::Relaxed);
+-                        }
+-                        let is_playing = playing.load(Ordering::Relaxed);
+-                        let play_label = if is_playing { "⏹ Stop" } else { "▶ Play" };
+-                        if ui.button(play_label).clicked() {
+-                            playing.store(!is_playing, Ordering::Relaxed);
+-                        }
+-                    });
+-                });
+-
+-                ui.add_space(3.0);
+-                kick_waveform(ui, &params);
+-                ui.add_space(4.0);
+-
+-                // ── PRESETS (single row) ─────────────────────────────────────
+-                ui.horizontal(|ui| {
+-                    ui.spacing_mut().item_spacing.x = 3.0;
+-                    let count = presets::PRESETS.len();
+-                    let bw = (ui.available_width() - 3.0 * (count as f32 - 1.0)) / count as f32;
+-                    for preset in presets::PRESETS {
+-                        let btn = egui::Button::new(
+-                            egui::RichText::new(preset.name)
+-                                .font(egui::FontId::monospace(8.5))
++                egui::ScrollArea::vertical().show(ui, |ui| {
++                    // ── TITLE BAR ─────────────────────────────────────────────
++                    ui.horizontal(|ui| {
++                        ui.label(
++                            egui::RichText::new("HARDKICK")
++                                .font(egui::FontId::proportional(16.0))
++                                .strong()
+                                 .color(ACCENT),
+-                        )
+-                        .fill(SECTION_BG)
+-                        .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
+-                        .min_size(egui::vec2(bw, 20.0));
+-                        if ui.add(btn).clicked() {
+-                            presets::apply(preset, &params, setter);
+-                        }
+-                    }
+-                });
+-
+-                ui.add_space(5.0);
+-
+-                // ── ROW A: PITCH | AMP | SHAPE ───────────────────────────────
+-                ui.horizontal_top(|ui| {
+-                    ui.spacing_mut().item_spacing.x = 5.0;
+-
+-                    panel(ui, "PITCH", |ui| {
+-                        knob(ui, "Start", &params.pitch_start, setter);
+-                        knob(ui, "End", &params.pitch_end, setter);
+-                        knob(ui, "Decay", &params.decay, setter);
+-                        knob(ui, "Curve", &params.curve, setter);
+-                    });
+-
+-                    panel(ui, "AMP", |ui| {
+-                        knob(ui, "Decay", &params.amp_decay, setter);
+-                        knob(ui, "Curve", &params.amp_curve, setter);
+-                        knob(ui, "Level", &params.level, setter);
+-                    });
+-
+-                    panel(ui, "SHAPE", |ui| {
+-                        lever_switch(
+-                            ui,
+-                            "MODE",
+-                            params.shaper.value(),
+-                            &[
+-                                (Shaper::Tube, "TUBE"),
+-                                (Shaper::Hard, "HARD"),
+-                                (Shaper::Fold, "FOLD"),
+-                            ],
+-                            |v| {
+-                                setter.begin_set_parameter(&params.shaper);
+-                                setter.set_parameter(&params.shaper, v);
+-                                setter.end_set_parameter(&params.shaper);
+-                            },
+                         );
+-                        knob(ui, "Drive", &params.drive, setter);
+-                        knob(ui, "Bias", &params.bias, setter);
+-                        knob(ui, "Mix", &params.dist_mix, setter);
+-                        knob(ui, "Xover", &params.crossover_freq, setter);
+-                    });
+-                });
+-
+-                ui.add_space(5.0);
+-
+-                // ── ROW B: EQ | TRANSIENT | OUTPUT | SEQ ─────────────────────
+-                ui.horizontal_top(|ui| {
+-                    ui.spacing_mut().item_spacing.x = 5.0;
+-
+-                    panel(ui, "EQ / SCREECH", |ui| {
+-                        knob(ui, "Freq", &params.pre_eq_freq, setter);
+-                        knob(ui, "Q", &params.pre_eq_q, setter);
+-                        knob(ui, "Gain", &params.pre_eq_gain, setter);
+-                        knob(ui, "Tone", &params.tone, setter);
++                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                            if ui.button("💾 WAV").clicked() {
++                                let path = format!(
++                                    "{}/hardkick-export.wav",
++                                    std::env::var("HOME").unwrap_or_else(|_| ".".into())
++                                );
++                                match export_wav(&params, &path) {
++                                    Ok(()) => nih_plug::nih_log!("Exported to {}", path),
++                                    Err(e) => nih_plug::nih_log!("Export failed: {}", e),
++                                }
++                            }
++                            if ui.button("⚡ Trig").clicked() {
++                                trigger.store(true, Ordering::Relaxed);
++                            }
++                            let is_playing = playing.load(Ordering::Relaxed);
++                            if ui.button(if is_playing { "⏹ Stop" } else { "▶ Play" }).clicked() {
++                                playing.store(!is_playing, Ordering::Relaxed);
++                            }
++                        });
+                     });
+ 
+-                    panel(ui, "TRANSIENT", |ui| {
+-                        knob(ui, "Click", &params.click_level, setter);
+-                        knob(ui, "Decay", &params.click_decay, setter);
+-                        knob(ui, "Tone", &params.click_tone, setter);
++                    ui.add_space(3.0);
++                    kick_waveform(ui, &params);
++                    ui.add_space(3.0);
++
++                    // ── PRESETS ───────────────────────────────────────────────
++                    ui.horizontal(|ui| {
++                        ui.spacing_mut().item_spacing.x = 3.0;
++                        let n = presets::PRESETS.len() as f32;
++                        let bw = (ui.available_width() - 3.0 * (n - 1.0)) / n;
++                        for preset in presets::PRESETS {
++                            let btn = egui::Button::new(
++                                egui::RichText::new(preset.name)
++                                    .font(egui::FontId::monospace(8.5))
++                                    .color(ACCENT),
++                            )
++                            .fill(SECTION_BG)
++                            .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
++                            .min_size(egui::vec2(bw, 19.0));
++                            if ui.add(btn).clicked() {
++                                presets::apply(preset, &params, setter);
++                            }
++                        }
+                     });
+ 
+-                    panel(ui, "OUTPUT", |ui| {
+-                        lever_switch(
+-                            ui,
+-                            "OS",
+-                            params.oversample.value(),
+-                            &[
+-                                (OsFactor::Off, "OFF"),
+-                                (OsFactor::X2, "2x"),
+-                                (OsFactor::X4, "4x"),
+-                            ],
+-                            |v| {
+-                                setter.begin_set_parameter(&params.oversample);
+-                                setter.set_parameter(&params.oversample, v);
+-                                setter.end_set_parameter(&params.oversample);
+-                            },
+-                        );
+-                        knob(ui, "Ceil", &params.limiter_threshold, setter);
+-                        knob(ui, "Rel", &params.limiter_release, setter);
++                    ui.add_space(4.0);
++
++                    // ── ROW 1: ATTACK | BODY | SHAPE ─────────────────────────
++                    ui.columns(3, |cols| {
++                        // ATTACK — transient layer and onset shaping.
++                        // The click is a filtered noise burst mixed in parallel
++                        // AFTER distortion (keeps it crisp and unsmeared).
++                        panel(&mut cols[0], "ATTACK", |ui| {
++                            knob(ui, "Level", &params.click_level, setter);
++                            knob(ui, "Decay", &params.click_decay, setter);
++                            knob(ui, "Tone", &params.click_tone, setter);
++                            knob(ui, "Atk", &params.amp_attack, setter);
++                        });
++
++                        // BODY — the tonal tail: pitch sweep + amplitude envelope.
++                        panel(&mut cols[1], "BODY", |ui| {
++                            knob(ui, "Start", &params.pitch_start, setter);
++                            knob(ui, "End", &params.pitch_end, setter);
++                            knob(ui, "P.Dec", &params.decay, setter);
++                            knob(ui, "Curve", &params.curve, setter);
++                            knob(ui, "A.Dec", &params.amp_decay, setter);
++                            knob(ui, "A.Crv", &params.amp_curve, setter);
++                            knob(ui, "Level", &params.level, setter);
++                        });
++
++                        // SHAPE — distortion applied to the HIGH band only (above Xover).
++                        // The sub band is always passed clean to preserve low-end punch.
++                        panel(&mut cols[2], "SHAPE  [high band only]", |ui| {
++                            lever_switch(
++                                ui, "MODE",
++                                params.shaper.value(),
++                                &[
++                                    (Shaper::Tube, "TUBE"),
++                                    (Shaper::Hard, "HARD"),
++                                    (Shaper::Fold, "FOLD"),
++                                ],
++                                |v| {
++                                    setter.begin_set_parameter(&params.shaper);
++                                    setter.set_parameter(&params.shaper, v);
++                                    setter.end_set_parameter(&params.shaper);
++                                },
++                            );
++                            knob(ui, "Xover", &params.crossover_freq, setter);
++                            knob(ui, "Drive", &params.drive, setter);
++                            knob(ui, "Bias", &params.bias, setter);
++                            knob(ui, "Mix", &params.dist_mix, setter);
++                        });
+                     });
+ 
+-                    panel(ui, "SEQ", |ui| {
+-                        knob(ui, "BPM", &params.bpm, setter);
++                    ui.add_space(4.0);
++
++                    // ── ROW 2: EQ | OUTPUT | SEQ ──────────────────────────────
++                    ui.columns(3, |cols| {
++                        // EQ — pre-distortion peaking EQ feeds into the shaper to create
++                        // the rawstyle screech; post-EQ (Tone) is a high-shelf trim.
++                        panel(&mut cols[0], "EQ / SCREECH  [pre-dist]", |ui| {
++                            knob(ui, "Freq", &params.pre_eq_freq, setter);
++                            knob(ui, "Q", &params.pre_eq_q, setter);
++                            knob(ui, "Gain", &params.pre_eq_gain, setter);
++                            knob(ui, "Tone", &params.tone, setter);
++                        });
++
++                        // OUTPUT — oversampling and brickwall limiter.
++                        panel(&mut cols[1], "OUTPUT", |ui| {
++                            lever_switch(
++                                ui, "OS",
++                                params.oversample.value(),
++                                &[
++                                    (OsFactor::Off, "OFF"),
++                                    (OsFactor::X2, "2×"),
++                                    (OsFactor::X4, "4×"),
++                                ],
++                                |v| {
++                                    setter.begin_set_parameter(&params.oversample);
++                                    setter.set_parameter(&params.oversample, v);
++                                    setter.end_set_parameter(&params.oversample);
++                                },
++                            );
++                            knob(ui, "Ceil", &params.limiter_threshold, setter);
++                            knob(ui, "Rel", &params.limiter_release, setter);
++                        });
++
++                        // SEQ — internal beat clock for the standalone audition loop.
++                        panel(&mut cols[2], "SEQ", |ui| {
++                            knob(ui, "BPM", &params.bpm, setter);
++                        });
+                     });
+                 });
+             });
+diff --git a/src/lib.rs b/src/lib.rs
+index 11a8b03..aaf72ee 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -45,6 +45,10 @@ pub struct HardKick {
+     limiter: Limiter,
+     oversampler: Oversampler,
+     wave_shaper: WaveShaper,
++    // Onset ramp — fades in amplitude over `onset_total` samples on each trigger,
++    // preventing the click caused by an instantaneous jump from silence to full gain.
++    onset_pos: u32,
++    onset_total: u32,
+ }
+ 
+ impl Default for HardKick {
+@@ -74,6 +78,8 @@ impl Default for HardKick {
+             limiter: Limiter::default(),
+             oversampler: Oversampler::default(),
+             wave_shaper: WaveShaper::default(),
++            onset_pos: 0,
++            onset_total: 0,
+         }
+     }
+ }
+@@ -104,6 +110,11 @@ impl HardKick {
+         self.pitch_env.trigger();
+         self.amp_env.trigger();
+         self.click_env.trigger();
++        // Capture the onset ramp length at trigger time so a mid-note param change
++        // doesn't corrupt an in-progress ramp.
++        let attack_ms = self.params.amp_attack.value();
++        self.onset_total = (attack_ms * 0.001 * self.sample_rate).max(1.0) as u32;
++        self.onset_pos = 0;
+     }
+ }
+ 
+@@ -165,6 +176,8 @@ impl Plugin for HardKick {
+         self.limiter.reset();
+         self.oversampler.reset();
+         self.wave_shaper.reset();
++        self.onset_pos = 0;
++        self.onset_total = 0;
+     }
+ 
+     fn process(
+@@ -299,9 +312,19 @@ impl Plugin for HardKick {
+                 0.0
+             };
+ 
++            // Onset ramp — linear fade-in over amp_attack samples to prevent
++            // the click caused by an instantaneous jump from silence to full amplitude.
++            let onset_gain = if self.onset_pos < self.onset_total {
++                let g = self.onset_pos as f32 / self.onset_total as f32;
++                self.onset_pos += 1;
++                g
++            } else {
++                1.0
++            };
++
+             // Brickwall limiter — lookahead peak detection, instant attack,
+-            // configurable release. Replaces the crude hard clip from earlier milestones.
+-            let raw = self.limiter.process(tonal + click);
++            // configurable release.
++            let raw = self.limiter.process((tonal + click) * onset_gain);
+ 
+             // Declick: linearly fade to zero before firing a pending retrigger.
+             let value = if self.declick_counter > 0 {
+diff --git a/src/params.rs b/src/params.rs
+index 83fbc8b..130b1aa 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -19,6 +19,11 @@ pub struct HardKickParams {
+     #[id = "curve"]
+     pub curve: FloatParam,
+ 
++    /// Amplitude attack time in milliseconds — ramps from silence to full gain on each
++    /// trigger. Prevents the click caused by an instantaneous onset at high drive levels.
++    #[id = "amp_attack"]
++    pub amp_attack: FloatParam,
++
+     /// Amplitude decay time in seconds — independent from pitch decay.
+     #[id = "amp_decay"]
+     pub amp_decay: FloatParam,
+@@ -151,6 +156,18 @@ impl Default for HardKickParams {
+             curve: FloatParam::new("Curve", 2.0, FloatRange::Linear { min: 0.1, max: 8.0 })
+                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
+ 
++            amp_attack: FloatParam::new(
++                "Amp attack",
++                2.0,
++                FloatRange::Skewed {
++                    min: 0.0,
++                    max: 20.0,
++                    factor: FloatRange::skew_factor(-1.0),
++                },
++            )
++            .with_unit(" ms")
++            .with_value_to_string(formatters::v2s_f32_rounded(1)),
++
+             amp_decay: FloatParam::new(
+                 "Amp decay",
+                 0.5,
+diff --git a/src/presets.rs b/src/presets.rs
+index 03b4cb5..d12b1a3 100644
+--- a/src/presets.rs
++++ b/src/presets.rs
+@@ -2,42 +2,34 @@ use crate::dsp::{OsFactor, Shaper};
+ use crate::params::HardKickParams;
+ use nih_plug::context::gui::ParamSetter;
+ 
+-/// A complete snapshot of every plugin parameter.
+ pub struct Preset {
+     pub name: &'static str,
+-    // PITCH
+     pub pitch_start: f32,
+     pub pitch_end: f32,
+     pub decay: f32,
+     pub curve: f32,
+-    // AMPLITUDE
++    pub amp_attack: f32,
+     pub amp_decay: f32,
+     pub amp_curve: f32,
+     pub level: f32,
+-    // SHAPING
+     pub shaper: Shaper,
+     pub drive: f32,
+     pub bias: f32,
+     pub dist_mix: f32,
+     pub crossover_freq: f32,
+-    // EQ
+     pub pre_eq_freq: f32,
+     pub pre_eq_q: f32,
+     pub pre_eq_gain: f32,
+     pub tone: f32,
+-    // TRANSIENT
+     pub click_level: f32,
+     pub click_decay: f32,
+     pub click_tone: f32,
+-    // OUTPUT
+     pub oversample: OsFactor,
+     pub limiter_threshold: f32,
+     pub limiter_release: f32,
+-    // SEQUENCER
+     pub bpm: f32,
+ }
+ 
+-/// Apply all values from a preset to the live parameter set.
+ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+     macro_rules! set {
+         ($param:expr, $val:expr) => {{
+@@ -50,6 +42,7 @@ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+     set!(params.pitch_end, preset.pitch_end);
+     set!(params.decay, preset.decay);
+     set!(params.curve, preset.curve);
++    set!(params.amp_attack, preset.amp_attack);
+     set!(params.amp_decay, preset.amp_decay);
+     set!(params.amp_curve, preset.amp_curve);
+     set!(params.level, preset.level);
+@@ -72,78 +65,81 @@ pub fn apply(preset: &Preset, params: &HardKickParams, setter: &ParamSetter) {
+ }
+ 
+ pub const PRESETS: &[Preset] = &[
+-    // 1. Classic Hardstyle — deep pitch drop, clean sub, soft saturation, punchy click.
+-    //    The reference point: heavy low end, smooth decay, no screech.
++    // Classic Hardstyle — deep exponential pitch drop, tube saturation for body,
++    // moderate click for definition. Sub below 120 Hz stays clean.
+     Preset {
+         name: "Classic Hard",
+         pitch_start: 180.0,
+         pitch_end: 45.0,
+         decay: 0.5,
+         curve: 3.0,
++        amp_attack: 1.5,
+         amp_decay: 0.6,
+         amp_curve: 1.2,
+         level: 0.85,
+         shaper: Shaper::Tube,
+-        drive: 0.35,
+-        bias: 0.0,
++        drive: 0.30,
++        bias: 0.15,
+         dist_mix: 1.0,
+         crossover_freq: 120.0,
+         pre_eq_freq: 2000.0,
+         pre_eq_q: 3.0,
+         pre_eq_gain: 0.0,
+         tone: -2.0,
+-        click_level: 0.4,
++        click_level: 0.40,
+         click_decay: 5.0,
+         click_tone: 3000.0,
+         oversample: OsFactor::X2,
+-        limiter_threshold: -0.3,
++        limiter_threshold: -0.5,
+         limiter_release: 100.0,
+         bpm: 150.0,
+     },
+ 
+-    // 2. Raw Screech — the rawstyle "laser" tone: extreme pre-EQ boost into the
+-    //    folder, asymmetric bias for even harmonics, crossover low so the sub
+-    //    survives the carnage.
++    // Raw Screech — narrow pre-EQ peak boosted into the tube saturator generates
++    // the rawstyle screech. High bias adds asymmetric even harmonics for thickness.
++    // 4x oversampling keeps the top end clean at this extreme drive.
+     Preset {
+         name: "Raw Screech",
+         pitch_start: 200.0,
+         pitch_end: 50.0,
+         decay: 0.35,
+         curve: 4.5,
++        amp_attack: 1.0,
+         amp_decay: 0.45,
+         amp_curve: 1.5,
+         level: 0.80,
+-        shaper: Shaper::Fold,
+-        drive: 0.75,
+-        bias: 0.25,
++        shaper: Shaper::Tube,
++        drive: 0.65,
++        bias: 0.30,
+         dist_mix: 1.0,
+         crossover_freq: 100.0,
+         pre_eq_freq: 2800.0,
+         pre_eq_q: 6.0,
+-        pre_eq_gain: 18.0,
+-        tone: -3.0,
+-        click_level: 0.55,
++        pre_eq_gain: 16.0,
++        tone: -4.0,
++        click_level: 0.50,
+         click_decay: 3.0,
+         click_tone: 4000.0,
+         oversample: OsFactor::X4,
+-        limiter_threshold: -0.3,
++        limiter_threshold: -0.5,
+         limiter_release: 80.0,
+         bpm: 150.0,
+     },
+ 
+-    // 3. Minimal Tek — short, punchy, lo-fi. Hard clipper, almost no body, all
+-    //    attack. Works well at higher BPMs.
++    // Minimal Tek — short, punchy, hard-clipped. Almost all attack, minimal tail.
++    // Strong click gives the percussive character of tek/hard techno kicks.
+     Preset {
+         name: "Minimal Tek",
+         pitch_start: 130.0,
+         pitch_end: 55.0,
+         decay: 0.18,
+         curve: 2.0,
++        amp_attack: 0.5,
+         amp_decay: 0.22,
+         amp_curve: 2.0,
+-        level: 0.90,
++        level: 0.88,
+         shaper: Shaper::Hard,
+-        drive: 0.60,
++        drive: 0.55,
+         bias: 0.10,
+         dist_mix: 1.0,
+         crossover_freq: 150.0,
+@@ -160,20 +156,21 @@ pub const PRESETS: &[Preset] = &[
+         bpm: 160.0,
+     },
+ 
+-    // 4. Sub Pressure — massive sub, very low crossover so almost the whole
+-    //    signal stays clean, gentle drive only. Designed for maximum low-end
+-    //    weight in a club system.
++    // Sub Pressure — maximum low-end weight. Crossover at 80 Hz keeps almost the
++    // entire sub range clean; only the high band gets light tube saturation.
++    // Long decay, gentle onset, no screech.
+     Preset {
+         name: "Sub Pressure",
+         pitch_start: 150.0,
+         pitch_end: 38.0,
+         decay: 0.70,
+         curve: 2.5,
++        amp_attack: 3.0,
+         amp_decay: 0.80,
+         amp_curve: 1.0,
+-        level: 0.88,
++        level: 0.86,
+         shaper: Shaper::Tube,
+-        drive: 0.20,
++        drive: 0.15,
+         bias: 0.0,
+         dist_mix: 0.6,
+         crossover_freq: 80.0,
+@@ -181,28 +178,30 @@ pub const PRESETS: &[Preset] = &[
+         pre_eq_q: 3.0,
+         pre_eq_gain: 0.0,
+         tone: -4.0,
+-        click_level: 0.20,
++        click_level: 0.15,
+         click_decay: 8.0,
+         click_tone: 2000.0,
+         oversample: OsFactor::X2,
+-        limiter_threshold: -0.3,
++        limiter_threshold: -0.5,
+         limiter_release: 150.0,
+         bpm: 145.0,
+     },
+ 
+-    // 5. Industrial Stomp — asymmetric hard clip, strong bias for a thick,
+-    //    even-harmonic stack, sharp metallic click. More aggressive than rawstyle.
++    // Industrial — asymmetric hard-clip at high bias creates a thick stack of even
++    // harmonics. Sharp click, bright tone, aggressive pitch drop. Sounds like it
++    // was recorded through a blown speaker.
+     Preset {
+         name: "Industrial",
+         pitch_start: 220.0,
+         pitch_end: 55.0,
+         decay: 0.28,
+         curve: 5.0,
++        amp_attack: 1.0,
+         amp_decay: 0.32,
+         amp_curve: 1.8,
+         level: 0.82,
+         shaper: Shaper::Hard,
+-        drive: 0.85,
++        drive: 0.80,
+         bias: 0.40,
+         dist_mix: 1.0,
+         crossover_freq: 130.0,
+@@ -219,33 +218,34 @@ pub const PRESETS: &[Preset] = &[
+         bpm: 155.0,
+     },
+ 
+-    // 6. Floating Bounce — longer decay, slow curve, very soft saturation.
+-    //    Warmer and more melodic than a typical hard kick; useful as a "colour"
+-    //    kick underneath a main one or in slower uptempo tracks.
++    // Fold Metal — sine wavefolder with ADAA. The folding carves dense metallic
++    // overtones; at this drive the kick has a synth-like, almost acid quality.
++    // Heavy pre-EQ into the folder for extra screech character.
+     Preset {
+-        name: "Floating",
+-        pitch_start: 160.0,
+-        pitch_end: 42.0,
+-        decay: 0.90,
+-        curve: 1.5,
+-        amp_decay: 1.10,
+-        amp_curve: 0.8,
+-        level: 0.75,
+-        shaper: Shaper::Tube,
+-        drive: 0.15,
++        name: "Fold Metal",
++        pitch_start: 190.0,
++        pitch_end: 48.0,
++        decay: 0.32,
++        curve: 3.5,
++        amp_attack: 2.0,
++        amp_decay: 0.40,
++        amp_curve: 1.6,
++        level: 0.80,
++        shaper: Shaper::Fold,
++        drive: 0.60,
+         bias: 0.0,
+-        dist_mix: 0.5,
+-        crossover_freq: 100.0,
+-        pre_eq_freq: 2000.0,
+-        pre_eq_q: 3.0,
+-        pre_eq_gain: 0.0,
+-        tone: -1.0,
+-        click_level: 0.10,
+-        click_decay: 10.0,
+-        click_tone: 1500.0,
+-        oversample: OsFactor::X2,
+-        limiter_threshold: -0.3,
+-        limiter_release: 200.0,
+-        bpm: 138.0,
++        dist_mix: 1.0,
++        crossover_freq: 110.0,
++        pre_eq_freq: 3200.0,
++        pre_eq_q: 5.0,
++        pre_eq_gain: 12.0,
++        tone: -2.0,
++        click_level: 0.45,
++        click_decay: 4.0,
++        click_tone: 3500.0,
++        oversample: OsFactor::X4,
++        limiter_threshold: -0.5,
++        limiter_release: 90.0,
++        bpm: 150.0,
+     },
+ ];
+-- 
+2.43.0
+
