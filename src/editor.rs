@@ -33,7 +33,10 @@ fn knob<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSette
     let radius = 17.0;
     let center = egui::pos2(rect.center().x, rect.top() + radius + 6.0);
     let knob_rect = egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0));
-    let resp = ui.interact(knob_rect, ui.id().with(label), egui::Sense::click_and_drag());
+    // Use the param's unique name (not the display label) as the egui ID salt —
+    // multiple panels share short display labels like "Tone" and "Level", so
+    // hashing those would alias the interactions onto a single widget.
+    let resp = ui.interact(knob_rect, ui.id().with(param.name()), egui::Sense::click_and_drag());
 
     if resp.drag_started() {
         setter.begin_set_parameter(param);
@@ -314,32 +317,48 @@ pub fn create(
 
                     ui.add_space(4.0);
 
-                    // ── ROW 1: ATTACK | BODY | SHAPE ─────────────────────────
-                    ui.columns(3, |cols| {
-                        // ATTACK — transient layer and onset shaping.
-                        // The click is a filtered noise burst mixed in parallel
-                        // AFTER distortion (keeps it crisp and unsmeared).
-                        panel(&mut cols[0], "ATTACK", |ui| {
-                            knob(ui, "Level", &params.click_level, setter);
-                            knob(ui, "Decay", &params.click_decay, setter);
-                            knob(ui, "Tone", &params.click_tone, setter);
-                            knob(ui, "Atk", &params.amp_attack, setter);
-                        });
+                    // Each panel takes its natural width (knob count × cell width)
+                    // instead of an equal third of the window — avoids overlap when
+                    // panels have different knob counts.
+                    let row_spacing = egui::vec2(4.0, 0.0);
 
-                        // BODY — the tonal tail: pitch sweep + amplitude envelope.
-                        panel(&mut cols[1], "BODY", |ui| {
+                    // ── ROW 1: PITCH | AMP | ATTACK | SHAPE ──────────────────
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = row_spacing;
+
+                        // PITCH — exponential sweep parameters.
+                        panel(ui, "PITCH", |ui| {
                             knob(ui, "Start", &params.pitch_start, setter);
                             knob(ui, "End", &params.pitch_end, setter);
-                            knob(ui, "P.Dec", &params.decay, setter);
+                            knob(ui, "Decay", &params.decay, setter);
                             knob(ui, "Curve", &params.curve, setter);
-                            knob(ui, "A.Dec", &params.amp_decay, setter);
-                            knob(ui, "A.Crv", &params.amp_curve, setter);
+                        });
+
+                        // AMP — amplitude envelope.
+                        panel(ui, "AMP", |ui| {
+                            knob(ui, "Atk", &params.amp_attack, setter);
+                            knob(ui, "Decay", &params.amp_decay, setter);
+                            knob(ui, "Curve", &params.amp_curve, setter);
                             knob(ui, "Level", &params.level, setter);
                         });
 
+                        // ATTACK — transient click layer, mixed in parallel AFTER distortion.
+                        panel(ui, "CLICK", |ui| {
+                            knob(ui, "Level", &params.click_level, setter);
+                            knob(ui, "Decay", &params.click_decay, setter);
+                            knob(ui, "Tone", &params.click_tone, setter);
+                        });
+                    });
+
+                    ui.add_space(4.0);
+
+                    // ── ROW 2: SHAPE | EQ | OUTPUT | SEQ ─────────────────────
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = row_spacing;
+
                         // SHAPE — distortion applied to the HIGH band only (above Xover).
-                        // The sub band is always passed clean to preserve low-end punch.
-                        panel(&mut cols[2], "SHAPE  [high band only]", |ui| {
+                        // The sub band always passes clean to preserve low-end punch.
+                        panel(ui, "SHAPE  [high band only]", |ui| {
                             lever_switch(
                                 ui, "MODE",
                                 params.shaper.value(),
@@ -359,23 +378,18 @@ pub fn create(
                             knob(ui, "Bias", &params.bias, setter);
                             knob(ui, "Mix", &params.dist_mix, setter);
                         });
-                    });
 
-                    ui.add_space(4.0);
-
-                    // ── ROW 2: EQ | OUTPUT | SEQ ──────────────────────────────
-                    ui.columns(3, |cols| {
-                        // EQ — pre-distortion peaking EQ feeds into the shaper to create
-                        // the rawstyle screech; post-EQ (Tone) is a high-shelf trim.
-                        panel(&mut cols[0], "EQ / SCREECH  [pre-dist]", |ui| {
+                        // EQ — pre-distortion peaking EQ generates the screech;
+                        // Tone is a post-distortion high-shelf trim.
+                        panel(ui, "EQ  [pre-dist]", |ui| {
                             knob(ui, "Freq", &params.pre_eq_freq, setter);
                             knob(ui, "Q", &params.pre_eq_q, setter);
                             knob(ui, "Gain", &params.pre_eq_gain, setter);
                             knob(ui, "Tone", &params.tone, setter);
                         });
 
-                        // OUTPUT — oversampling and brickwall limiter.
-                        panel(&mut cols[1], "OUTPUT", |ui| {
+                        // OUTPUT — oversampling factor and brickwall limiter.
+                        panel(ui, "OUTPUT", |ui| {
                             lever_switch(
                                 ui, "OS",
                                 params.oversample.value(),
@@ -394,8 +408,8 @@ pub fn create(
                             knob(ui, "Rel", &params.limiter_release, setter);
                         });
 
-                        // SEQ — internal beat clock for the standalone audition loop.
-                        panel(&mut cols[2], "SEQ", |ui| {
+                        // SEQ — standalone audition BPM.
+                        panel(ui, "SEQ", |ui| {
                             knob(ui, "BPM", &params.bpm, setter);
                         });
                     });

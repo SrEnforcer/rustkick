@@ -55,7 +55,7 @@ impl Default for HardKick {
     fn default() -> Self {
         Self {
             params: Arc::new(HardKickParams::default()),
-            editor_state: EguiState::from_size(720, 430),
+            editor_state: EguiState::from_size(780, 410),
             trigger: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             osc: SineOsc::new(44_100.0),
