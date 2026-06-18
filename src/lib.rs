@@ -45,6 +45,10 @@ pub struct HardKick {
     limiter: Limiter,
     oversampler: Oversampler,
     wave_shaper: WaveShaper,
+    // Onset ramp — fades in amplitude over `onset_total` samples on each trigger,
+    // preventing the click caused by an instantaneous jump from silence to full gain.
+    onset_pos: u32,
+    onset_total: u32,
 }
 
 impl Default for HardKick {
@@ -74,6 +78,8 @@ impl Default for HardKick {
             limiter: Limiter::default(),
             oversampler: Oversampler::default(),
             wave_shaper: WaveShaper::default(),
+            onset_pos: 0,
+            onset_total: 0,
         }
     }
 }
@@ -104,6 +110,11 @@ impl HardKick {
         self.pitch_env.trigger();
         self.amp_env.trigger();
         self.click_env.trigger();
+        // Capture the onset ramp length at trigger time so a mid-note param change
+        // doesn't corrupt an in-progress ramp.
+        let attack_ms = self.params.amp_attack.value();
+        self.onset_total = (attack_ms * 0.001 * self.sample_rate).max(1.0) as u32;
+        self.onset_pos = 0;
     }
 }
 
@@ -165,6 +176,8 @@ impl Plugin for HardKick {
         self.limiter.reset();
         self.oversampler.reset();
         self.wave_shaper.reset();
+        self.onset_pos = 0;
+        self.onset_total = 0;
     }
 
     fn process(
@@ -299,9 +312,19 @@ impl Plugin for HardKick {
                 0.0
             };
 
+            // Onset ramp — linear fade-in over amp_attack samples to prevent
+            // the click caused by an instantaneous jump from silence to full amplitude.
+            let onset_gain = if self.onset_pos < self.onset_total {
+                let g = self.onset_pos as f32 / self.onset_total as f32;
+                self.onset_pos += 1;
+                g
+            } else {
+                1.0
+            };
+
             // Brickwall limiter — lookahead peak detection, instant attack,
-            // configurable release. Replaces the crude hard clip from earlier milestones.
-            let raw = self.limiter.process(tonal + click);
+            // configurable release.
+            let raw = self.limiter.process((tonal + click) * onset_gain);
 
             // Declick: linearly fade to zero before firing a pending retrigger.
             let value = if self.declick_counter > 0 {

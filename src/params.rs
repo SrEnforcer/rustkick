@@ -19,6 +19,11 @@ pub struct HardKickParams {
     #[id = "curve"]
     pub curve: FloatParam,
 
+    /// Amplitude attack time in milliseconds — ramps from silence to full gain on each
+    /// trigger. Prevents the click caused by an instantaneous onset at high drive levels.
+    #[id = "amp_attack"]
+    pub amp_attack: FloatParam,
+
     /// Amplitude decay time in seconds — independent from pitch decay.
     #[id = "amp_decay"]
     pub amp_decay: FloatParam,
@@ -150,6 +155,18 @@ impl Default for HardKickParams {
 
             curve: FloatParam::new("Curve", 2.0, FloatRange::Linear { min: 0.1, max: 8.0 })
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            amp_attack: FloatParam::new(
+                "Amp attack",
+                2.0,
+                FloatRange::Skewed {
+                    min: 0.0,
+                    max: 20.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
             amp_decay: FloatParam::new(
                 "Amp decay",
